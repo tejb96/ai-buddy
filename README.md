@@ -1,5 +1,10 @@
 # AI Buddy
 
+> **Status (branch `kira-agent`):** the assistant is now **Kira**, an agent with web search, notes search and other
+> tools, running one model (`qwen3.6-moe-35b-a3b-FLM`) for everything. This README still describes the previous
+> version in places; see [docs/phase0-findings.md](docs/phase0-findings.md) for the current state, benchmarks,
+> known issues and what's left to do.
+
 A voice companion that runs entirely on this laptop. Talk to it out loud to chat, rehearse a presentation, or practice a conversation (job interview, tough conversation, small talk). After practice sessions it gives you feedback on filler words, pace, long pauses, rambling, and clarity, plus 2–3 specific things to improve. Transcripts, metrics, and feedback are saved locally so you can track progress.
 
 Everything runs locally through [Lemonade](https://lemonade-server.ai/). The LLMs and speech-to-text are FastFlowLM (FLM) models on the Ryzen AI NPU; text-to-speech is Kokoro on the CPU. The app makes no network calls except to Lemonade on `localhost`.
@@ -50,7 +55,7 @@ To get an **AI Buddy** entry in GNOME's Activities search, run `scripts/install-
 
 ## How to use it
 
-**Chat.** Hold **Space** (or press and hold the round button), talk, and let go. Sunny answers out loud and starts speaking while the rest of the reply is still being written. Press Space while it talks to cut it off and say something else; **Esc** just stops the voice.
+**Chat.** Hold **Space** (or press and hold the round button), talk, and let go. Kira answers out loud and starts speaking while the rest of the reply is still being written. Press Space while it talks to cut it off and say something else; **Esc** just stops the voice.
 
 **Presentation.** Press **Start talk** and give your talk; the buddy stays silent. Your speech is transcribed in ~25-second chunks while you talk, and the 35B coach model loads in the background, so feedback starts right after you press **Stop**. You get the measured numbers immediately, then the coach's written feedback streams in. **Read the top tips aloud** speaks the three improvements.
 
@@ -80,7 +85,7 @@ Edit `config.toml` and restart. The most useful settings:
 | `models.chat_ctx_size` / `feedback_ctx_size` | 8192 / 16384 | Context passed on load. Lemonade's 64k default makes the 4B model use 13 GB of RAM instead of 5 GB. |
 | `feedback.think` | `false` | Lets the 35B "think" before writing feedback: deeper, but 30 s or more slower. |
 | `voice.tts_voice` | `af_heart` | Kokoro voice (`af_bella`, `am_michael`, `bf_emma`, `bm_george`, …). |
-| `persona.name` / `style` | Sunny / warm, curious… | The chat buddy's name and personality. |
+| `persona.name` / `style` | Kira / warm, encouraging and honest | The assistant's name and personality. |
 | `practice.long_pause_s` | 2.0 | What counts as a long pause. |
 | `practice.target_wpm_low` / `high` | 120 / 160 | Comfortable pace range. |
 | `app.data_dir` | `~/.local/share/ai-buddy` | Where sessions are stored. |

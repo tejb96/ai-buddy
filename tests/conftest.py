@@ -83,7 +83,7 @@ def server(tmp_path_factory):
     while time.time() < deadline:
         try:
             status = json.load(urllib.request.urlopen(f"{base}/api/status", timeout=5))
-            if status["warm"] and all(status["models"][r]["state"] == "ready" for r in ("stt", "chat", "tts")):
+            if status["warm"] and all(status["models"][r]["state"] == "ready" for r in ("stt", "llm", "tts")):
                 break
         except OSError:
             pass

@@ -17,7 +17,7 @@ from conftest import Client, say, silence
 
 pytestmark = [pytest.mark.lemonade, pytest.mark.asyncio(loop_scope="session")]
 
-QUESTION = "Hey Sunny, I just got back from a long walk by the river. What should I cook for dinner tonight?"
+QUESTION = "Hey Kira, I just got back from a long walk by the river. What should I cook for dinner tonight?"
 
 
 async def test_rejects_foreign_origin(server):

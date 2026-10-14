@@ -58,7 +58,7 @@ def wav_bytes(pcm: bytes) -> bytes:
 def page(server):
     ART.mkdir(exist_ok=True)
     clips = {
-        "question": silence(0.2) + say("Hi Sunny! I just finished a long bike ride along the coast. "
+        "question": silence(0.2) + say("Hi Kira! I just finished a long bike ride along the coast. "
                                        "What should I eat to recover?") + silence(0.3),
         "story": silence(0.2) + say("Can you tell me a really long story about a lighthouse keeper?") + silence(0.3),
         "talk": silence(0.6) + say(
