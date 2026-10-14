@@ -10,11 +10,12 @@ load_timeout_s = 180
 [models]
 # Everything runs locally through Lemonade: FLM models on the NPU, Kokoro on the CPU.
 stt = "whisper-v3-turbo-FLM"            # speech-to-text (NPU)
-llm = "qwen3.6-moe-35b-a3b-FLM"         # Kira: conversation, tools and coaching, thinking off (NPU)
+llm = "gemma4-it-12b-FLM"               # Kira: hears your voice; conversation, tools, coaching; thinking off (NPU)
 tts = "kokoro-v1"                       # text-to-speech (CPU)
 llm_ctx_size = 32768
-# Models offered in the settings panel. qwen3-it-4b-FLM starts talking ~3 s sooner but makes up answers more often.
-llm_choices = ["qwen3.6-moe-35b-a3b-FLM", "qwen3-it-4b-FLM"]
+# Models offered in the settings panel. The 35B reads Whisper's text instead of your voice and needs 22 GB;
+# the 4B starts talking sooner but makes up answers more often.
+llm_choices = ["gemma4-it-12b-FLM", "qwen3.6-moe-35b-a3b-FLM", "qwen3-it-4b-FLM"]
 # Embedding model for note search, run by llama.cpp on the CPU; search then combines meaning and keywords.
 # "" = keywords only. Changing it re-embeds the notes. NOT SET UP YET (see docs/phase0-findings.md, "Start
 # here"): first `lemonade backends install llamacpp:cpu` and `lemonade pull Qwen3-Embedding-0.6B-GGUF`,

@@ -20,7 +20,7 @@ class LemonadeCfg:
 @dataclass
 class ModelsCfg:
     stt: str = "whisper-v3-turbo-FLM"
-    llm: str = "qwen3.6-moe-35b-a3b-FLM"
+    llm: str = "gemma4-it-12b-FLM"
     tts: str = "kokoro-v1"
     llm_ctx_size: int = 32768
     # Embedding model for note search (llama.cpp on the CPU), e.g. "Qwen3-Embedding-0.6B-GGUF"; "" = keywords only.
@@ -28,7 +28,8 @@ class ModelsCfg:
     embed_backend: str = "cpu"          # llama.cpp backend for the embedding model
     embed_threads: int = 4              # CPU threads for it (leaves cores for Kokoro)
     # LLMs offered in the settings panel.
-    llm_choices: list[str] = field(default_factory=lambda: ["qwen3.6-moe-35b-a3b-FLM", "qwen3-it-4b-FLM"])
+    llm_choices: list[str] = field(default_factory=lambda: ["gemma4-it-12b-FLM", "qwen3.6-moe-35b-a3b-FLM",
+                                                            "qwen3-it-4b-FLM"])
 
 
 @dataclass

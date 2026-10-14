@@ -1,20 +1,288 @@
-# Kira: Phase 0 findings and handoff
+# Kira: findings and handoff
 
-Session of 2026-10-14 on the ThinkPad P14s Gen 6 AMD (Ryzen AI 7 PRO 350, XDNA 2 NPU, Radeon 860M, 64 GB),
-Lemonade 2026.41.1 with FLM v1.0.6, Kokoro b21. Work is on branch `kira-agent`. Benchmark scripts are in
-[`scripts/bench/`](../scripts/bench/README.md).
+Sessions of 2026-10-14 on the ThinkPad P14s Gen 6 AMD (Ryzen AI 7 PRO 350, XDNA 2 NPU, Radeon 860M, 64 GB),
+Lemonade 2026.41.1 with FLM v1.0.6, Kokoro b21. Work is on branch `kira-agent` (merged into `main` at the end
+of session 3). Benchmark scripts are in [`scripts/bench/`](../scripts/bench/README.md).
+
+## Start here (handoff after session 3)
+
+**Where things stand:**
+- **Step 1 (validate Gemma 12B) is done.** Gemma 4 12B with audio input passed and is now the default chat model, with the 35B as an option. Whisper provides the chat transcript.
+- **Step 2 (skills build) is mostly built.** Skills, MCP, the router, asking permission, audio chat and the embedding code are covered by 171 unit tests that run without models. **Nothing in Step 2 has run against the real models or in the real app yet.**
+- **Not started:** README, ROADMAP, GitHub description, and Step 3 (verification).
+
+The user ended the session here: finish the running test, record the results, hand off, run the unit tests, commit and merge.
+
+**Next, in this order:**
+1. **Smoke-test the real app** (`uv run ai-buddy`):
+   - one spoken chat with a tool call and a notes lookup;
+   - one practice session.
+
+   Expect bugs: the new session code (audio turns, NPU lock, skills, router, permission card) has only met fakes so far.
+2. **Step 3 tests:**
+   - Update and run the end-to-end tests. `tests/conftest.py` already gives the test server sample notes and a test MCP server (`tests/fixtures/mcp_notes_server.py`).
+   - Still to do in the backend tests: drop the latency asserts (`first_audio < 6`); add scenario tests against the real model for:
+     - a tool turn and a notes turn;
+     - the MCP to-do list, where `todo_add_item` asks first and `todo_list_items` doesn't;
+     - no-guessing ("Where am I going on my trip next month?", "my sister is visiting from Vancouver… downtown?").
+   - Browser tests: the skill switches in Settings, the permission card, and practice tabs hiding when the coach is off.
+   - Then run the full suite.
+3. **CPU embeddings** (code ready; `models.embed = ""` until then):
+   - Run `lemonade backends install llamacpp:cpu` and `lemonade pull Qwen3-Embedding-0.6B-GGUF`.
+   - Check that the app's `/load` options (`llamacpp_backend: "cpu"`, `llamacpp_args: "--threads 4"`, in `ModelManager._options`) are the right keys: `/v1/health` must show the model with device `cpu`, never the iGPU.
+   - Set `models.embed`, re-index, and check retrieval on real notes. Fall back to `nomic-embed-text-v1-GGUF` if Qwen3 doesn't work well (prompt formats for both are in `knowledge.EMBED_FORMATS`).
+   - Then delete `embed-gemma-300m-FLM`.
+4. **Delete `gemma4-it-e4b-FLM`** (`lemonade delete gemma4-it-e4b-FLM`; already decided). `gemma4e-flash-e4b-FLM` uses the same files (`Gemma4-E4B-IT-NPU2`), so it goes too.
+5. **Docs:**
+   - Rewrite the README for the new positioning: a local voice AI agent with plug-in skills, a voice-first coach and creative partner. Describe only what's built; planned skills go under a roadmap.
+   - Update the GitHub description with `gh repo edit tejb96/ai-buddy --description …`.
+   - Write `docs/ROADMAP.md` from "Roadmap direction" below.
+6. **After `scripts/update-flm.sh`** (FLM 1.0.8; the user runs it, it needs sudo), re-check:
+   - concurrent Whisper + LLM, and `--preemption`;
+   - `tool_choice`;
+   - Gemma's decode speed.
+
+**Rules the user set** (also in the session prompt):
+- **Efficiency first.** It's a laptop: use the NPU where a model can run there. CPU or GPU only for models that exist only there (Kokoro and the embeddings on the CPU). No latency benchmarks.
+- **No extra cost per turn.** Don't add tokens or LLM calls to every turn unless they clearly pay for themselves.
+- **No guessing.** Kira uses a tool or says she doesn't know, and never invents details (cities, personal stories). Unambiguous intents are enforced in code.
+- **Spoken style.** Plain sentences; details and sources go on screen.
+- **Ask before acting.** Skills that change something ask first.
+- **Built-in models only.** Use models from Lemonade's built-in registry, never custom `user.*` models.
+- **Settings.** App-level Lemonade/FLM settings are preferred; no sudo without asking; record every change here.
+- **Commit as you go.** If the context gets long, write a handoff and stop.
 
 ## Decisions
 
 | Topic | Decision |
 |---|---|
 | Priorities | Answer quality, no fabrication, and efficiency (power, heat, fan noise) over raw latency. A reply starting within ~4 s is acceptable if it is more accurate. |
-| Where models run | LLM and speech-to-text on the NPU through Lemonade/FLM. Kokoro TTS stays on the CPU. No iGPU models (the whisper.cpp and llama.cpp Vulkan backends and models installed for benchmarking were removed again). |
-| LLM | `qwen3.6-moe-35b-a3b-FLM` is the single model for chat, tools and coaching, thinking off for live chat. No model swapping. `qwen3-it-4b-FLM` stays available as an option (config `models.llm_choices`, and the model picker in the settings dialog). |
-| Speech-to-text | `whisper-v3-turbo-FLM` (NPU). |
-| Embeddings | On the CPU (decided at the end of the session; **not implemented or benchmarked yet**, see To do). Keyword search (SQLite FTS5/BM25) works without any embedding model. |
+| Where models run | LLM and speech-to-text on the NPU through Lemonade/FLM. Kokoro TTS and the note embeddings on the CPU. No iGPU models. |
+| LLM | **`gemma4-it-12b-FLM` with audio input** (session 3, Step 1): one model for chat, tools and coaching, thinking off, no swapping. `qwen3.6-moe-35b-a3b-FLM` (reads Whisper's text) and `qwen3-it-4b-FLM` stay selectable (`models.llm_choices`, the settings dialog). |
+| Speech-to-text | `whisper-v3-turbo-FLM` (NPU) for the chat transcript (bubble, history, router) and always for practice modes (verbatim, filler counts). Gemma's own transcript is an option (`chat.transcript = "heard"`) but not accurate enough to be the default. |
+| One NPU job at a time | Whisper and the LLM never run at the same moment (concurrent requests corrupted both results). The app serializes them. |
+| Connectors | **GAIA dropped.** MCP servers become skills through the official MCP Python SDK (`mcp` 2.3.0). Kira's own capabilities are skills in the Agent Skills `SKILL.md` format. |
+| Embeddings | `Qwen3-Embedding-0.6B-GGUF` on llama.cpp's **CPU** backend (fallback `nomic-embed-text-v1-GGUF`), from Lemonade's built-in registry only. Search is hybrid: embeddings plus BM25. Code done; Lemonade setup pending, so `models.embed = ""` for now. |
+| Models to delete | `gemma4-it-e4b-FLM` (failed the quality test; not deleted yet). `embed-gemma-300m-FLM` once CPU embeddings work. |
+| FLM 1.0.8 | The user runs `scripts/update-flm.sh` (sudo). Don't block on it. |
 | Voice | `af_heart` default; selectable in the app (9 curated Kokoro voices with a preview). |
 | Web search | DuckDuckGo's HTML endpoint, no API key; self-hosted SearXNG optional (`tools.search_backend`). |
+
+## Session 3, Step 1: validating Gemma 4 12B with audio input
+
+**The decision rule (set by the user):**
+- **Switch to Gemma 12B with audio input as the default** if all three hold:
+  - **(a)** it's at least as good as the 35B baseline on the full tool-calling set;
+  - **(c)** it's stable over a long conversation;
+  - **(d)** it stays loaded next to FLM Whisper.
+- **Chat transcripts:** from Gemma's own transcript if (b) shows it's accurate enough, otherwise from Whisper.
+- **Practice modes:** always Whisper.
+
+**How it was run:**
+- **Inputs:** Kira's prompt and tools, and the same Kokoro clips as the 35B baseline (cached, identical audio).
+- **Settings:** temperature 0.6, thinking off, Whisper loaded throughout.
+- **Pacing:** 3–4 s between calls, 8 s between conversation turns.
+- **Scope:** no latency was measured. Thermal numbers come from `common.ThermalLog`: CPU Tctl (k10temp), APU package power (amdgpu PPT), ThinkPad fan RPM and Lemonade's NPU utilization.
+
+### (a) Tool calling: the full baseline set
+
+`audio_llm.py audio:gemma4-it-12b-FLM tools,multi`: 24 spoken prompts × clean and white noise at 12 dB SNR.
+
+| | Whisper + 35B (baseline) | Gemma 12B, audio in |
+|---|---|---|
+| Right tool | 42/48 (40/48 before blank-name repair) | **46/48**, no blank names |
+| Misses | date ×2 answered from the prompt (correct); 18 % ×2 answered directly (correct); Paris weather + time ×2 | Paris weather + time ×2 (searched, skipped the clock) |
+| Follow-ups after a tool turn or small talk (fixed test) | 3/3 (reduced set) | **10/10** |
+
+- **Called the tools the 35B skipped:** `get_datetime` for "today's date" and `calculate` for 18 % of 240.
+- **Invented a little shared history:** "I was just thinking about how much I enjoy our practice sessions together", "I've been looking forward to our session today". The new no-guessing rule now covers this.
+- **Thermal (13 min):**
+  - Tctl: average 56.5 °C, max 61.8.
+  - Package power: average 12.2 W, max 20.
+  - Fan: average 3,680 RPM, max 4,095.
+  - NPU: busy 59 % on average.
+- **Result: (a) passed.**
+
+### (b) Gemma's own transcript, written before the reply in the same turn
+
+`audio_llm.py heard:gemma4-it-12b-FLM heard`:
+- **The instruction:** the system prompt asks for a verbatim `<heard>…</heard>` (fillers included) before every reply, with tools attached.
+- **94 turns:** the 48 tool clips, the 16 filler-heavy answers and the first 30 LibriSpeech clips.
+- **Comparison:** against Whisper's transcripts of the same clips from the baseline run. Numbers and titles are normalized the same way for both ("18 %" = "eighteen percent", "Mr." = "mister").
+
+| | Gemma `<heard>` | Whisper |
+|---|---|---|
+| Transcript present | 87/94; **27/34 on turns with a tool call** (7 went straight to the call) | always |
+| WER, chat prompts with a transcript (41 clips) | 0.3 % | 0.8 % |
+| WER, filler-heavy answers (16 clips) | 3.2 % | 2.8 % |
+| WER, real speech (30 LibriSpeech clips, 549 words) | **10.7 %** | 4.4 % |
+| Fillers kept (of 52) | 41 | 37 |
+| Extra output per turn | median 19 tokens, mean 22, max 92 (1.6 per word). At the 12B's ~6.3 tok/s that's ~3 s before the first spoken word | none |
+| Tool choice with the instruction | 42/48 (vs 46/48 without) | — |
+
+- **The instruction hurt tool use.** Date ×2, 18 % and √(729·3) were answered directly; the last was wrong ("about twenty-seven"; it's 46.8). The Paris misses (×2) remained.
+- **Gemma's real-speech errors aren't only mishearings:**
+  - "He" became "She" twice.
+  - It invented filler that was never said ("You know, I'm getting a fire" for "near the fire"; "well,"; "oh").
+  - It added a made-up tail ("Where is that? What's the… what's the…").
+
+  So its higher filler count can't be trusted for coaching either.
+- **Thermal (~60 min):**
+  - Tctl: average 56.0 °C, max 63.8.
+  - Package power: average 12.7 W, max 18.1.
+  - Fan: average 3,890 RPM.
+  - NPU: busy 70 % on average.
+  - No process restarts.
+- **Result: not accurate enough → chat transcripts come from Whisper.** `chat.transcript = "heard"` stays available, but isn't recommended.
+
+### Probes that shaped the design
+
+**Audio costs about 25 tokens per second of speech** (`gemma_audio_cache.py`): a 4.4 s clip costs 111 tokens, a 2.7 s clip 71.
+
+**The prompt cache needs earlier recordings kept as audio:**
+- With earlier user turns kept as audio, each new turn prefilled only 120–167 tokens.
+- With the audio replaced by its transcript after each turn, FLM re-read everything every turn (673 → 751 tokens).
+- So the app keeps recordings in the history. History trimming, which re-reads anyway, swaps them for transcripts.
+
+**FLM ignores `tool_choice`** (`tool_choice.py`). Neither `"required"` nor a named function had any effect; the model told a cat joke either way.
+
+**An identical prompt is re-read in full:**
+- Sending the same prompt twice re-read all 1,016 tokens; retrying after an aborted stream re-read all 1,079.
+- FLM only reuses its cache when the new prompt is longer than the cached one.
+- So "abort and retry the same request" is expensive.
+- The router therefore makes the needed calls itself:
+  - before the model, when Whisper's words come first;
+  - or by stopping an answer that skips a needed tool, then continuing with a longer prompt.
+
+**Two FLM jobs at once corrupt each other:**
+- Whisper and a Gemma stream sent together: the stream ended empty after 68.6 s, and Whisper returned "What's's going to the weather? What? What? What? What?" (68.9 s).
+- Neither process crashed or was evicted.
+- My first stability run sent them together, which is how this surfaced.
+
+**FLM stops generating when the client disconnects:**
+- Aborting a stream, then calling Whisper straight away, gave a correct transcript in 2.4 s (2.3 s alone).
+- So the app now runs one NPU job at a time (`ModelManager._npu`), and every LLM stream is closed when abandoned.
+- FLM's `--preemption` option (default 0) might allow concurrency; it's untested.
+
+**Gemma 12B is dense:** it decodes ~6.3 tok/s by FLM's own numbers, against ~17 for the 35B MoE. Two consequences:
+- **Practice feedback is slower:** ~500 words take roughly 2 minutes.
+- **Interview feedback blocks Whisper:** a Whisper call queued behind it (for example, talking in chat meanwhile) waits until the feedback is written.
+
+### (c) Stability: a 20-turn spoken conversation
+
+`stability.py gemma4-it-12b-FLM whisper`, about 25 min of real use:
+- **Setup:**
+  - Gemma heard each recording; Whisper transcribed it first.
+  - It used the real tools: web search over DuckDuckGo, the clock, the calculator, and keyword notes over a sample folder.
+  - It used Kira's new prompt, kept earlier turns as audio, and returned tool results as a user message.
+  - Turns were 8 s apart.
+- **Tools:** 20/20 right (weather, Tokyo time right after a tool turn, notes ×4, two calculations, Stanley Cup and museum hours searched, days until Christmas), plus 7 no-tool turns. No errors.
+- **Prompt cache:** no misses. The first request of every turn prefilled only 111–247 tokens while the context grew from 1,258 to 9,249 tokens. A tool result read in the same turn adds its own 116–1,200 tokens.
+- **Processes:** no restarts and no evictions (same PIDs throughout).
+- **Drift:**
+  - No drift: the forecast restated in turn 19 matched turn 2 word for word.
+  - No markdown, links or over-long replies.
+  - "Where am I going on my trip next month?" → it searched the notes, said it found nothing and asked; no invented place.
+  - One weak link: it tied the job interview to the Henderson talking points it had read earlier ("would it help if we did a quick practice run of the opening story?").
+- **Request size:** 3.7 MB at the end, mostly the base64 recordings, resent with every request. Fine locally; trimming swaps them for text.
+- **Thermal:**
+  - Tctl: average 53.4 °C, max 67.9.
+  - Package power: average 10.7 W, max 20.
+  - Fan: average 2,860 RPM, max 3,290.
+  - NPU: busy 51 % on average.
+- **Note on an earlier run:** my first attempt ran Whisper *alongside* Gemma and every turn came back empty. That's how the concurrency problem above was found. The run reported here is the corrected, sequential one.
+
+### (d) Co-residency with Whisper
+
+**Gemma 12B and FLM Whisper stay loaded together.**
+- The same three processes (Whisper, Kokoro, Gemma 12B) ran for about 2.5 hours across (a), (b) and (c) with no restart or eviction.
+- **Practice session** (the end of `stability.py`): a ~25 s talk transcribed by Whisper in chunks, then the feedback written by Gemma (397 tokens at 6.7 tok/s).
+  - Whisper: 2/64 word errors, 6/7 fillers kept.
+  - Gemma's feedback had all the expected sections, quoted the talk, and took the metrics as given.
+  - The PIDs didn't change.
+- **The condition:** the two must never compute at the same moment. The app now enforces that with one NPU lock.
+
+### Decision
+
+**All three conditions hold, so `gemma4-it-12b-FLM` with audio input is the default chat model** (`config.toml`), with the 35B and the 4B still selectable:
+- (a) 46/48 vs 42/48;
+- (c) stable over 20 turns;
+- (d) works side by side with Whisper, run one at a time.
+
+**Chat transcripts come from Whisper** (b): it runs first, then Gemma hears the recording. Practice modes use Whisper as before.
+
+**Costs the user accepted by putting quality first:** Whisper's ~2.2 s comes before Gemma starts, and the 12B decodes at ~6 tok/s. Neither was measured as latency.
+
+## Session 3, Step 2: the skills build (status)
+
+**Built and unit-tested** (`uv run pytest -m "not lemonade"`: 171 passed, no models needed):
+- **Skills** (`ai_buddy/skills/`):
+  - **Format:** every capability is a folder in the Agent Skills format (`SKILL.md` front matter + instructions, validated against the agentskills.io spec), plus optional `tools.py` / `modes.py` / `assets/`.
+  - **Built-ins** (`ai_buddy/skills/builtin/`): `web-search`, `notes`, `clock`, `calculator` (the old tool plugins moved there) and `speaking-coach`. The coach's practice modes, scenarios (`assets/scenarios.toml`) and coach and role-play instructions (in `SKILL.md`) moved there too.
+  - **Your own skills:** go in folders listed in `skills.dirs`.
+  - **Switching:** on/off comes from `skills.enabled`, overridden by switches in Settings (saved in `settings.json`).
+  - **What goes into the chat prompt:**
+    - tool skills add their few lines of guidance;
+    - instruction-only skills add their body (capped at 1,500 characters);
+    - mode skills load their instructions only when a practice session runs;
+    - practice tabs disappear when the coach is off.
+- **MCP** (`ai_buddy/skills/mcp.py`, official SDK):
+  - Each `[mcp.servers.<name>]` (a stdio command or a URL) is a skill named after the server, with tools named `<name>_<tool>`.
+  - It connects and disconnects as the skill is switched.
+  - Tools ask first unless the server marks them read-only (`readOnlyHint`) or they're listed in `auto_approve`.
+  - Tested against a real stdio server (`tests/fixtures/mcp_notes_server.py`).
+- **Asking permission:**
+  - Tools with `confirm = True` (and MCP tools as above) make Kira ask out loud, while a card with Yes / No appears in her message.
+  - You can answer with the buttons or by saying yes or no: Whisper transcribes the answer and a pattern reads it, with no LLM call.
+  - No answer within `skills.confirm_timeout_s` counts as no.
+- **Router** (`ai_buddy/router.py`, `Tool.route`): strict patterns make the call in code when the intent is unambiguous.
+  - **Clock:** the time somewhere, including "…and what time is it there?"; days until a holiday or date.
+  - **Calculator:** "X % of Y", "X times Y".
+  - **Notes:** "my notes / resume / talking points…".
+  - **Web:** "search the web for…", "weather in <Place>".
+
+  Anything less clear is left to the model.
+- **Audio chat:**
+  - With an LLM labelled `audio` and `chat.audio_input`, Whisper transcribes first: the words go to the chat bubble, history and router.
+  - Gemma then gets the recording itself.
+  - Recordings stay in the history for the cache. When the history is trimmed, older recordings become their transcripts, except the turn in progress.
+  - A switch to a text-only model converts them too.
+- **Prompt:** standing no-guessing rules (`prompts.GROUNDING`), the spoken style ("Details and sources are shown on screen"), and an optional `[user] location`.
+- **Notes embeddings** (code only): hybrid search, the per-model prompt formats for Qwen3-Embedding (instruction on the query only) and nomic (`search_query:` / `search_document:`), re-embedding when the model changes, vectors held in memory, and keyword fallback while the model is unavailable. The embedding model is an optional `embed` role loaded on the CPU with a thread cap.
+- **Fixes found by the new tests:**
+  - The calculator dropped every comma, which broke `round(2.675, 2)` and `min(4, 5)`.
+  - `knowledge.py` still imported the old `tools/_web.py`.
+
+**Not done yet:** see "Start here". In short: real-model runs, the end-to-end tests, the app smoke test, the embedding setup, the README / ROADMAP / GitHub description, and the model deletions. Lemonade/FLM settings changed in session 3: **none**. The only Lemonade action was loading `gemma4-it-12b-FLM`, which evicted e4b from the LLM slot.
+
+## Roadmap direction (from the user; to become docs/ROADMAP.md)
+
+Kira is a local voice AI agent with plug-in skills: a voice-first coach and creative partner.
+
+1. **Practice:**
+   - speaking coach (built);
+   - interviews (built: conversation practice);
+   - job-posting mock interviews;
+   - language conversation practice.
+2. **Learn:**
+   - a teaching mode for a topic, a document or a repo;
+   - quizzes and exercises;
+   - an explain-it-back mode, where the user explains a concept aloud and Kira finds the gaps;
+   - spaced repetition (e.g. FSRS) for the concepts the user got wrong.
+3. **Create:**
+   - **Music producer, driving real Ubuntu tools:**
+     - Audacity's scripting pipe and Ardour Lua;
+     - SoX/FFmpeg and Rubber Band;
+     - Demucs and Basic Pitch;
+     - FluidSynth;
+     - ACE-Step via Lemonade.
+   - **Writing help:** lyrics, rhymes and song structure.
+   - **GPU on demand:** allowed for heavy music models, unloaded when leaving music mode.
+4. **Ecosystem:**
+   - any MCP server can become a skill (built);
+   - account connectors (Google, Microsoft, GitHub) through MCP servers.
+
+Out of scope: home automation and general computer control.
 
 ## Steps 1–2: connectors, one-model audio, FLM update (2026-10-14, second session)
 
@@ -83,12 +351,12 @@ What this means:
   - **Smoke test, then keep or undo:** runs `scripts/flm_smoke.py` (loads the configured models, one spoken turn Kokoro → Whisper → LLM, one `get_datetime` call). It rolls back automatically on failure, or manually with `--rollback`.
 - **Lemonade/FLM settings changed this session: none.** The only system changes are the two pulled Gemma models.
 
-### Decisions needed
+### Decisions (made by the user at the start of session 3)
 
-1. GAIA: drop it and use the MCP SDK (recommended)?
-2. Chat model: switch chat to `gemma4-it-12b-FLM` with audio input? If so, how should the user's words be obtained: a `<heard>` prefix (to test), a second Gemma pass, or Whisper? And should practice modes keep Whisper for filler counts?
-3. FLM 1.0.8: run `scripts/update-flm.sh` yourself (it needs sudo), then rerun `audio_llm.py` to see whether tool calling changed?
-4. Delete `gemma4-it-e4b-FLM` (9.1 GB, not good enough), and `embed-gemma-300m-FLM` if Step 3 uses CPU embeddings?
+1. GAIA: dropped. MCP through the official SDK, and Kira's skills in the Agent Skills `SKILL.md` format.
+2. Chat model: validate Gemma 12B first (session 3, Step 1 above), then switch if it passes.
+3. FLM 1.0.8: the user runs `scripts/update-flm.sh` later. Don't block on it.
+4. Delete `gemma4-it-e4b-FLM`, and `embed-gemma-300m-FLM` once CPU embeddings are in place.
 
 ## Speech-to-text (Goal 1)
 
@@ -207,7 +475,10 @@ the 35B and Whisper.
 - **Tool turns with the 35B are slow:** ~7–10 s until the filler line or Kira's own preamble, ~15–20 s until the answer.
 - **The first greeting after startup takes ~15 s** (fresh prefill). Speaking before it finishes cancels it, and that first turn is slow.
 
-## What's built (branch `kira-agent`)
+## What was built in sessions 1–2 (branch `kira-agent`)
+
+Session 3 moved the tools into skills and added MCP, the router, permission and audio chat: see "Session 3, Step 2".
+
 
 - **One model, no swapping.** The `llm` role replaces chat/feedback. Model picker in the settings dialog; voice and folder choices are saved in `<data_dir>/settings.json`.
 - **Kira.**
@@ -234,7 +505,10 @@ the 35B and Whisper.
 - **UI additions:** tool activity lines and sources in Kira's messages, live partial transcript for long turns, the greeting bubble.
 - **Security:** state-changing REST endpoints refuse other origins.
 
-## To do
+## To do (sessions 1–2; see "Start here" for the current list)
+
+Done in session 3: items 1 (via the router and Gemma's tool use), 2 (code only) and parts of 3 (unit tests for
+tools, the registry, knowledge, the agent loop and settings).
 
 1. **Fix the time fabrication.** Ideas:
    - Add a timestamp to each user message (cache-safe, append-only).
