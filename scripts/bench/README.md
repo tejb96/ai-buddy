@@ -20,6 +20,7 @@ Keep runs short and spaced out: long back-to-back loops heat the laptop up.
 | `stt_chunking.py <model> [min_s] [pause_s]` | Accuracy cost of cutting speech at pauses, and the leftover tail. |
 | `stt_realtime.py <model> [vad\|manual]` | Lemonade's `/realtime` WebSocket: interim and final transcript timing. |
 | `extract_librispeech.py <parquet> librispeech` | Converts the LibriSpeech sample to PCM + manifest (see below). |
+| `audio_llm.py whisper:<llm>\|audio:<llm> [sections]` | Same spoken test set through Whisper + a text LLM, or straight into an audio-input LLM (Gemma 4): tool choice, multi-turn no-guessing, understanding/reply style, transcription. `REDUCED=1` runs ~20 cases. |
 | `llm_bench.py <model> [ctx] [sections]` | Time to first spoken word in a growing conversation, prefill speed, 24 tool-calling prompts, tool result -> spoken answer. |
 | `llm_tune.py <model> <ctx> '<flm_args>'` | First-token latency under FLM launch args (`--pmode turbo`, `--prefill-chunk-len N`). |
 | `llm_cache_greeting.py` | Whether a generated greeting primes FLM's prompt cache for the first user turn. |

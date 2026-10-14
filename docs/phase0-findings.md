@@ -16,6 +16,80 @@ Lemonade 2026.41.1 with FLM v1.0.6, Kokoro b21. Work is on branch `kira-agent`. 
 | Voice | `af_heart` default; selectable in the app (9 curated Kokoro voices with a preview). |
 | Web search | DuckDuckGo's HTML endpoint, no API key; self-hosted SearXNG optional (`tools.search_backend`). |
 
+## Steps 1–2: connectors, one-model audio, FLM update (2026-10-14, second session)
+
+Scope of this session: investigate and test only, with no app changes. **Open decisions are at the end of this
+section.** Judged on quality, reliability and efficiency only; no latency was measured.
+
+### Step 1: GAIA connectors vs. plain MCP
+
+- **The connector code itself is standalone.** It's `amd-gaia` 0.24.1, inspected from its wheel without installing it. `gaia.connectors` needs only httpx, aiohttp and keyring, and doesn't touch Lemonade or any model; its CLI also imports GAIA's agent registry and hub installer.
+- **The package is too heavy.** `amd-gaia`'s *core* dependencies include `transformers` and `accelerate`, which resolve to **97 packages including torch 2.14 and ~15 CUDA wheels** (`uv pip compile`), plus `openai` and `tavily-python`.
+- **It also does less than it sounds like.** It only provides OAuth (PKCE) tokens for Google and Microsoft; the Gmail and Calendar tools live in GAIA's agents and sidecars. Google still needs your own OAuth client ID and secret (`GAIA_GOOGLE_CLIENT_ID/SECRET`). Its GitHub and Tavily "connectors" are just `npx` MCP-server entries.
+- **The official MCP Python SDK is light.** `mcp` 2.3.0 resolves to 29 small packages (starlette, pydantic, httpx2, jsonschema…), several of which FastAPI already brings.
+- **Recommendation: drop GAIA.** Add MCP support with the official SDK; GitHub, Tavily, Google Workspace and others then come in as existing MCP servers. If we want native Google later, a small PKCE flow with tokens in the keyring (`keyring` is one package) is the light route. Skills use the Agent Skills `SKILL.md` format: a folder with YAML front matter (`name`, `description`) and instructions, loaded progressively.
+
+### Step 2a: one model that hears (Gemma 4 audio input) vs. Whisper + 35B
+
+Script: `scripts/bench/audio_llm.py` (`whisper:<llm>` or `audio:<llm>`; `REDUCED=1` for the ~20-case subset).
+- **Setup:** Kira's real system prompt and tool schemas, spoken prompts synthesized by Kokoro (6 voices; "noisy" = white noise at 12 dB SNR), and real speech from LibriSpeech.
+- **Sampling:** temperature 0.6 for replies (`chat.temperature`), 0 for verbatim transcription, thinking off.
+- **Audio format:** Gemma gets the WAV as an `input_audio` content part in `/chat/completions`, through Lemonade 2026.41.1 and FLM 1.0.6. Both work.
+- **Pulled models:** `gemma4-it-e4b-FLM` (9.1 GB) and `gemma4-it-12b-FLM` (9.4 GB). The baseline ran the full suite; the Gemma models ran the reduced subset (the same prompts, voices and seeds as the matching baseline rows).
+
+**Full baseline, Whisper + qwen3.6-35B:**
+- **Tools:** 42/48 right, 40/48 before blank-name repair (2 blank names).
+- **Misses:**
+  - "today's date" ×2, answered from the date in the system prompt, which is correct.
+  - "18% of 240" ×2, answered directly (43.2, correct).
+  - Paris weather and time: one tool only, then an empty reply.
+- **Multi-turn:** 3/3 after fixing the test (the first version left out Kira's spoken answer after a tool turn, so the model repeated it).
+- **Fillers:** 37/52 kept.
+- **LibriSpeech:** 7.0% WER, 1 transcript cut short.
+
+**Reduced set, same cases** (✓ = right; my reading of the replies, not only the automatic regex):
+
+| | Whisper + 35B | Gemma 4 12B (audio) | Gemma 4 E4B (audio) |
+|---|---|---|---|
+| Tool choice, 10 spoken prompts | 7/10 (date and 18% answered directly, Paris only searched) | **9/10** (Paris: search only) | 6/10 ("I can check that for you" without calling, twice; date from the prompt; Paris) |
+| No guessing in multi-turn (time after a tool turn, museum hours after chat, jacket = no tool) | 3/3 | 3/3 | 2/3 (announced the museum lookup without calling) |
+| Understanding and reply, 4 spoken requests | Priya: searched art in *Vancouver* (she's visiting *from* there; noisy run: Los Angeles); meetings: odd `get_datetime` call; Rust ✓; Ava: 221 words with a list | Priya: searched art in *Toronto* (made up); meetings ✓ but said "the eleven-thirty-one meeting"; Rust ✓; Ava ✓ | Priya ✓ (asked what art she likes); meetings ✓; Rust ✓; Ava: heard "Arva" |
+| Spoken-style breaks (too long, lists) | 2 of 12 in the full run | 0 | 0, but invented a personal story ("I actually went to live in Australia") |
+| Blank tool names | yes (2 of 48 in the full run) | none | none |
+| LibriSpeech, 3 real clips (verbatim prompt) | 0 real errors | 1 ("a roast beef") | 3 ("Norris… manor is", "She tells") |
+
+What this means:
+- **12B is at least as good as Whisper + 35B on this set.** It got more tool decisions right, kept spoken style better, and returned no blank tool names, so the repair hack wasn't needed. It made one fabrication: "downtown Toronto" for an unspecified city. The 35B did the same with Los Angeles in the noisy run, so the no-guessing rule matters with either model.
+- **E4B isn't good enough.** It announces lookups instead of calling, invents personal anecdotes, and mishears real speech more often.
+- **Efficiency:** 12B means one 9.4 GB FLM process instead of 22.1 GB + 0.6 GB in two NPU processes, so less RAM and no third-process eviction risk. Note that the 12B is dense (12B parameters per token) while the 35B MoE activates ~3B. Per-token NPU work may therefore be *higher*, but each turn saves the whole Whisper pass. Not measured.
+- **Small sample:** 10 + 3 + 4 + 3 cases decide nothing at the ±1 level. 12B ≥ 35B is a fair reading; "clearly better" isn't.
+
+**Impact on coaching and on the app if Whisper goes away:**
+- **The app still needs your words as text** for the chat bubble, history, saved sessions and practice metrics (WPM, sentence length and repeated phrases all come from the transcript). An audio-in reply doesn't return a transcript. Options:
+  - a separate transcription request to the same Gemma (a second NPU pass per turn);
+  - ask Gemma to write `<heard>…</heard>` before its reply (one pass, more output tokens; untested);
+  - keep Whisper for the transcript only.
+- **Presentation and interview coaching:** filler counts come from the transcript. Whisper kept 37/52 fillers here (44/52 in Phase 0). LLM transcripts tend to tidy speech up, and Gemma's filler retention wasn't measured in the reduced run (`audio_llm.py audio:gemma4-it-12b-FLM transcribe` measures it). Until it is, practice modes should keep Whisper (0.6 GB, loaded on demand), or the coach loses its filler numbers. Pace and pauses come from the audio itself and are unaffected.
+
+### Step 2b: FastFlowLM 1.0.8
+
+- **Versions:** Lemonade 2026.41.1 bundles FLM **1.0.6**. The latest stable release is **1.0.8** (2026-10-12; 1.0.7 on 2026-09-30). HRX packages are a preview and are skipped.
+- **Breaking changes:** `hy-mt2:1.8b` was renamed to `hy-mt2-flash:1.8b` (we don't use it). The `model_list.json` entries for qwen3.6-35B, Whisper and all gemma4-it models are identical between 1.0.6 and 1.0.8, so **no weights need re-pulling**. 1.0.8 adds `qwen3.8-mtp:27b` (1.0.7), MiniCPM-V-4.7, and undocumented `*-rai` variants.
+- **Relevant fix:** `usage.prompt_tokens` now counts the cached prefix too (`cached_tokens` is reported separately). Our Phase 0 cache analysis read `prompt_tokens` as "tokens prefilled"; with 1.0.8, read `prompt_tokens_details.cached_tokens` instead.
+- **Tool calling: the release notes contain no fix for our issues.** Upstream #744 (Qwen3.6 multi-turn tool calls) and #739 (`<think>` leaking in non-streaming replies) are still open, as are #752 and #732 (embeddings). **Not tested on 1.0.8.** lemond runs as the `lemonade` system user and, with `flm.prefer_system`, finds `flm` on its system PATH. Installing it there needs sudo, which this session doesn't have.
+- **`scripts/update-flm.sh`** (new; `--check` tested, install path not run):
+  - **Check and confirm:** finds the latest stable standard release, shows the release notes since the current version, and asks for confirmation.
+  - **Install:** unpacks the portable package to `/opt/fastflowlm/<version>` (`current`/`previous` symlinks), with a wrapper at `/usr/local/bin/flm`. It sets `flm.prefer_system=true` and checks that Lemonade reports the new version.
+  - **Smoke test, then keep or undo:** runs `scripts/flm_smoke.py` (loads the configured models, one spoken turn Kokoro → Whisper → LLM, one `get_datetime` call). It rolls back automatically on failure, or manually with `--rollback`.
+- **Lemonade/FLM settings changed this session: none.** The only system changes are the two pulled Gemma models.
+
+### Decisions needed
+
+1. GAIA: drop it and use the MCP SDK (recommended)?
+2. Chat model: switch chat to `gemma4-it-12b-FLM` with audio input? If so, how should the user's words be obtained: a `<heard>` prefix (to test), a second Gemma pass, or Whisper? And should practice modes keep Whisper for filler counts?
+3. FLM 1.0.8: run `scripts/update-flm.sh` yourself (it needs sudo), then rerun `audio_llm.py` to see whether tool calling changed?
+4. Delete `gemma4-it-e4b-FLM` (9.1 GB, not good enough), and `embed-gemma-300m-FLM` if Step 3 uses CPU embeddings?
+
 ## Speech-to-text (Goal 1)
 
 **FLM Whisper's cost is fixed per call**, so transcribing in chunks while you talk can only save the small
