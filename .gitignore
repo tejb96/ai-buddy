@@ -4,3 +4,6 @@ __pycache__/
 .pytest_cache/
 /data/
 /test-artifacts/
+/scripts/bench/audio_cache/
+/scripts/bench/results/
+/scripts/bench/librispeech/
