@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI Buddy</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%232a78d6'/%3E%3Cpath d='M10 13c0-1 1-2 2-2s2 1 2 2M18 13c0-1 1-2 2-2s2 1 2 2M10.5 19c1.5 2 3.4 3 5.5 3s4-1 5.5-3' stroke='white' stroke-width='2' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">AI Buddy</span>
+    </div>
+    <nav class="tabs" role="tablist" aria-label="Mode">
+      <button role="tab" data-mode="chat" aria-selected="true">Chat</button>
+      <button role="tab" data-mode="presentation">Presentation</button>
+      <button role="tab" data-mode="interview">Conversation practice</button>
+      <button role="tab" data-mode="history">History</button>
+    </nav>
+    <div class="models" id="models" aria-label="Model status"></div>
+  </header>
+
+  <main id="main">
+    <section class="view" id="view-chat" aria-label="Chat">
+      <div class="thread" id="chat-thread" aria-live="polite">
+        <div class="empty" id="chat-empty">
+          <h1>Hi! I'm <span class="persona-name">Sunny</span>.</h1>
+          <p>Hold <kbd>Space</kbd> (or the button below) while you talk, then let go. Press <kbd>Space</kbd> again any time to cut me off.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="view" id="view-presentation" aria-label="Presentation practice" hidden>
+      <div class="pres-intro" id="pres-intro">
+        <h1>Presentation practice</h1>
+        <p>Press <strong>Start talk</strong> and give your presentation. <span class="persona-name">Sunny</span> stays quiet and listens the whole time. Press <strong>Stop</strong> when you finish to get feedback on filler words, pace, pauses, and clarity.</p>
+        <ul class="hints">
+          <li>Your talk is transcribed in the background while you speak, so feedback starts as soon as you stop.</li>
+          <li>The feedback model loads while you talk. Talks shorter than about 20 seconds wait a little for it.</li>
+        </ul>
+      </div>
+      <div class="pres-live" id="pres-live" hidden>
+        <div class="pres-clock"><span class="rec-dot" aria-hidden="true"></span><span id="pres-timer">0:00</span></div>
+        <p class="muted" id="pres-live-hint">Live transcript appears here every ~25 seconds.</p>
+        <div class="captions" id="pres-captions" aria-live="polite"></div>
+      </div>
+      <div id="pres-results"></div>
+    </section>
+
+    <section class="view" id="view-interview" aria-label="Conversation practice" hidden>
+      <form class="setup" id="iv-setup">
+        <h1>Conversation practice</h1>
+        <p class="muted">Pick a scenario. <span class="persona-name">Sunny</span> plays the other person, then coaches you when you end the session.</p>
+        <div class="scenarios" id="iv-scenarios" role="radiogroup" aria-label="Scenario"></div>
+        <label class="field">
+          <span id="iv-details-label">Details (optional)</span>
+          <input id="iv-details" type="text" autocomplete="off" aria-labelledby="iv-details-label">
+        </label>
+        <button class="btn primary" type="submit" id="iv-start">Start</button>
+      </form>
+      <div class="iv-running" id="iv-running" hidden>
+        <div class="iv-bar">
+          <div><strong id="iv-title"></strong> <span class="muted" id="iv-sub"></span></div>
+          <button class="btn" id="iv-end" type="button">End &amp; get feedback</button>
+        </div>
+        <div class="thread" id="iv-thread" aria-live="polite"></div>
+      </div>
+      <div id="iv-results"></div>
+    </section>
+
+    <section class="view" id="view-history" aria-label="History" hidden>
+      <div class="history-head">
+        <h1>Your progress</h1>
+        <p class="muted" id="history-path"></p>
+      </div>
+      <div id="history-trends"></div>
+      <div id="history-table"></div>
+    </section>
+  </main>
+
+  <div class="toasts" id="toasts" aria-live="assertive"></div>
+
+  <footer class="dock" id="dock">
+    <div class="status" id="status" aria-live="polite">
+      <span class="eq" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+      <span id="status-text">Connecting…</span>
+    </div>
+    <div class="dock-row">
+      <button class="talk" id="talk" type="button" aria-label="Hold to talk">
+        <svg class="ico-mic" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3Z"/><path d="M18 11.5a6 6 0 0 1-12 0M12 17.5V21M8.5 21h7" fill="none"/></svg>
+        <svg class="ico-stop" viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="2"/></svg>
+        <span class="ring" aria-hidden="true"></span>
+      </button>
+      <div class="meter" aria-hidden="true"><span id="meter-fill"></span></div>
+    </div>
+    <div class="dock-hint" id="dock-hint"></div>
+    <label class="handsfree" id="handsfree-wrap" title="Experimental: listens for your voice instead of push-to-talk">
+      <input type="checkbox" id="handsfree"> Hands-free <span class="tag">beta</span>
+    </label>
+  </footer>
+
+  <dialog class="detail" id="detail">
+    <div class="detail-body" id="detail-body"></div>
+  </dialog>
+
+  <script src="/static/markdown.js"></script>
+  <script src="/static/charts.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

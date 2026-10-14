@@ -1,0 +1,51 @@
+# AI Buddy configuration. Restart the app after editing.
+
+[lemonade]
+base_url = "http://localhost:13305/v1"
+# Seconds to wait for a single model load (the 35B MoE takes ~16 s on this laptop).
+load_timeout_s = 180
+
+[models]
+# Any model listed by `lemonade list` works here. LLMs must be FLM (NPU) models.
+stt = "whisper-v3-turbo-FLM"            # speech-to-text (NPU)
+chat = "qwen3-it-4b-FLM"                # live conversation, non-thinking (NPU)
+feedback = "qwen3.6-moe-35b-a3b-FLM"    # end-of-session critique (NPU)
+tts = "kokoro-v1"                       # text-to-speech (CPU)
+
+# Context sizes passed to Lemonade on load. Smaller = less RAM and slightly faster.
+chat_ctx_size = 8192
+feedback_ctx_size = 16384
+
+[chat]
+temperature = 0.7
+max_tokens = 200
+# Drop the oldest turns when the conversation history gets longer than this many words.
+history_word_budget = 3500
+
+[feedback]
+# FLM's qwen3.6 MoE thinks by default; thinking gives deeper critiques but adds 30 s+.
+think = false
+max_tokens = 1200
+temperature = 0.4
+
+[voice]
+tts_voice = "af_heart"   # Kokoro voices: af_heart, af_bella, af_nicole, am_michael, am_fenrir, bf_emma, bm_george, ...
+tts_speed = 1.0
+language = "en"
+
+[persona]
+name = "Sunny"
+style = "warm, curious, upbeat, and a little playful"
+
+[practice]
+long_pause_s = 2.0            # silence inside speech at least this long counts as a long pause
+target_wpm_low = 120
+target_wpm_high = 160
+presentation_chunk_s = 25     # transcribe presentations in chunks of about this length while you talk
+
+[app]
+host = "127.0.0.1"
+port = 8765
+data_dir = "~/.local/share/ai-buddy"
+save_audio = false            # also keep a WAV of every practice session
+open_window = true            # open a Chrome app window on start (falls back to the default browser)
