@@ -1,41 +1,77 @@
 # AI Buddy configuration. Restart the app after editing.
+# Voice, model and knowledge folder can also be changed in the app (gear icon); those choices are saved in
+# <data_dir>/settings.json and take precedence over the values here.
 
 [lemonade]
 base_url = "http://localhost:13305/v1"
-# Seconds to wait for a single model load (the 35B MoE takes ~16 s on this laptop).
+# Seconds to wait for a single model load (the 35B MoE takes ~15 s on this laptop).
 load_timeout_s = 180
 
 [models]
-# Any model listed by `lemonade list` works here. LLMs must be FLM (NPU) models.
+# Everything runs locally through Lemonade: FLM models on the NPU, Kokoro on the CPU.
 stt = "whisper-v3-turbo-FLM"            # speech-to-text (NPU)
-chat = "qwen3-it-4b-FLM"                # live conversation, non-thinking (NPU)
-feedback = "qwen3.6-moe-35b-a3b-FLM"    # end-of-session critique (NPU)
+llm = "qwen3.6-moe-35b-a3b-FLM"         # Kira: conversation, tools and coaching, thinking off (NPU)
 tts = "kokoro-v1"                       # text-to-speech (CPU)
-
-# Context sizes passed to Lemonade on load. Smaller = less RAM and slightly faster.
-chat_ctx_size = 8192
-feedback_ctx_size = 16384
+llm_ctx_size = 32768
+# Models offered in the settings panel. qwen3-it-4b-FLM starts talking ~3 s sooner but makes up answers more often.
+llm_choices = ["qwen3.6-moe-35b-a3b-FLM", "qwen3-it-4b-FLM"]
+# Optional embedding model for semantic note search (keyword search is always on). Leave empty on
+# Lemonade 2026.41.1 / FLM 1.0.6: embed-gemma-300m-FLM hangs there, and loading it next to the 35B and
+# Whisper makes Lemonade unload every model. See README.
+embed = ""
 
 [chat]
-temperature = 0.7
-max_tokens = 200
-# Drop the oldest turns when the conversation history gets longer than this many words.
-history_word_budget = 3500
+temperature = 0.6
+max_tokens = 300
+# Drop the oldest exchanges when the conversation history gets longer than this many words.
+history_word_budget = 8000
+# Kira writes a short greeting when a chat starts; it also preloads the model's prompt cache.
+greet = true
+timeout_s = 90                # give up on a reply that takes longer than this
 
 [feedback]
-# FLM's qwen3.6 MoE thinks by default; thinking gives deeper critiques but adds 30 s+.
+# Lets the model "think" before writing feedback: deeper, but 30 s or more slower.
 think = false
-max_tokens = 1200
+max_tokens = 1500
 temperature = 0.4
 
+[stt]
+# Push-to-talk turns longer than ~live_chunk_s are transcribed in pieces while you talk, cut in pauses
+# of at least live_pause_s, so only the last piece is left when you let go.
+live_chunk_s = 15
+live_chunk_max_s = 25
+live_pause_s = 0.5
+
 [voice]
-tts_voice = "af_heart"   # Kokoro voices: af_heart, af_bella, af_nicole, am_michael, am_fenrir, bf_emma, bm_george, ...
+tts_voice = "af_heart"   # default Kokoro voice; pick another in the app
 tts_speed = 1.0
 language = "en"
 
 [persona]
-name = "Sunny"
-style = "warm, curious, upbeat, and a little playful"
+name = "Kira"
+style = "warm, encouraging and honest"
+
+[tools]
+# Tools are plugins in ai_buddy/tools/ (one file each). Remove a name to switch that tool off.
+enabled = ["web_search", "fetch_page", "get_datetime", "calculate", "search_notes"]
+max_calls_per_turn = 3
+timeout_s = 15                # per tool call
+plugin_dir = ""               # optional folder with your own single-file tool plugins
+search_backend = "duckduckgo" # "duckduckgo" (no key needed) or "searxng"
+searxng_url = ""              # e.g. "http://localhost:8888" for a self-hosted SearXNG with JSON output enabled
+search_results = 5
+pages_to_read = 2             # top results Kira opens and reads
+page_chars = 1200             # text kept from each page (the model reads ~1 token per 4 characters)
+fetch_timeout_s = 6
+
+[rag]
+# Kira's knowledge folder: notes, talking points, resumes, READMEs (Markdown, text, PDF, DOCX, HTML).
+folder = "~/Documents/ai-buddy-notes"
+watch = true                  # re-index automatically when files change
+chunk_chars = 1200
+chunk_overlap = 200
+top_k = 4
+max_file_mb = 20
 
 [practice]
 long_pause_s = 2.0            # silence inside speech at least this long counts as a long pause

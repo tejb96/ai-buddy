@@ -20,14 +20,18 @@
       <button role="tab" data-mode="history">History</button>
     </nav>
     <div class="models" id="models" aria-label="Model status"></div>
+    <button class="icon-btn" id="open-settings" type="button" aria-label="Settings" title="Voice, model and knowledge folder">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.03 1.56V21a2 2 0 1 1-4 0v-.09A1.7 1.7 0 0 0 8.9 19.4a1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-1.56-1.03H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.6 8.9a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 8.96 4.6 1.7 1.7 0 0 0 10 3.04V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1.03 1.56 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9c.26.6.85 1 1.51 1H21a2 2 0 1 1 0 4h-.09c-.66 0-1.25.4-1.51 1Z"/></svg>
+    </button>
   </header>
 
   <main id="main">
     <section class="view" id="view-chat" aria-label="Chat">
       <div class="thread" id="chat-thread" aria-live="polite">
         <div class="empty" id="chat-empty">
-          <h1>Hi! I'm <span class="persona-name">Sunny</span>.</h1>
+          <h1>Hi! I'm <span class="persona-name">Kira</span>.</h1>
           <p>Hold <kbd>Space</kbd> (or the button below) while you talk, then let go. Press <kbd>Space</kbd> again any time to cut me off.</p>
+          <p class="muted">I can look things up online, check your notes, do the math and tell the time.</p>
         </div>
       </div>
     </section>
@@ -35,10 +39,14 @@
     <section class="view" id="view-presentation" aria-label="Presentation practice" hidden>
       <div class="pres-intro" id="pres-intro">
         <h1>Presentation practice</h1>
-        <p>Press <strong>Start talk</strong> and give your presentation. <span class="persona-name">Sunny</span> stays quiet and listens the whole time. Press <strong>Stop</strong> when you finish to get feedback on filler words, pace, pauses, and clarity.</p>
+        <p>Press <strong>Start talk</strong> and give your presentation. <span class="persona-name">Kira</span> stays quiet and listens the whole time. Press <strong>Stop</strong> when you finish to get honest feedback on filler words, pace, pauses, and clarity.</p>
+        <label class="field">
+          <span>What's the talk about? <span class="muted">(optional)</span></span>
+          <input id="pres-topic" type="text" autocomplete="off" placeholder="e.g. Q3 results for the Henderson account">
+        </label>
         <ul class="hints">
           <li>Your talk is transcribed in the background while you speak, so feedback starts as soon as you stop.</li>
-          <li>The feedback model loads while you talk. Talks shorter than about 20 seconds wait a little for it.</li>
+          <li>If your knowledge folder has talking points for this talk, <span class="persona-name">Kira</span> checks which ones you covered.</li>
         </ul>
       </div>
       <div class="pres-live" id="pres-live" hidden>
@@ -52,7 +60,7 @@
     <section class="view" id="view-interview" aria-label="Conversation practice" hidden>
       <form class="setup" id="iv-setup">
         <h1>Conversation practice</h1>
-        <p class="muted">Pick a scenario. <span class="persona-name">Sunny</span> plays the other person, then coaches you when you end the session.</p>
+        <p class="muted">Pick a scenario. <span class="persona-name">Kira</span> plays the other person, then coaches you when you end the session. Your resume and talking points in the knowledge folder make it more realistic.</p>
         <div class="scenarios" id="iv-scenarios" role="radiogroup" aria-label="Scenario"></div>
         <label class="field">
           <span id="iv-details-label">Details (optional)</span>
@@ -103,6 +111,45 @@
 
   <dialog class="detail" id="detail">
     <div class="detail-body" id="detail-body"></div>
+  </dialog>
+
+  <dialog class="detail settings" id="settings" aria-labelledby="settings-title">
+    <div class="detail-body">
+      <div class="detail-head">
+        <h1 id="settings-title">Settings</h1>
+        <button class="btn" type="button" id="close-settings">Close</button>
+      </div>
+      <section class="set">
+        <h2>Voice</h2>
+        <div class="row">
+          <select id="set-voice" aria-label="Voice"></select>
+          <button class="btn" type="button" id="preview-voice">Play sample</button>
+        </div>
+      </section>
+      <section class="set">
+        <h2>Model</h2>
+        <div class="row"><select id="set-llm" aria-label="Language model"></select></div>
+        <p class="muted small" id="set-llm-note"></p>
+      </section>
+      <section class="set">
+        <h2>Knowledge folder</h2>
+        <p class="muted small">Notes, talking points, resumes and READMEs (Markdown, text, PDF, Word, HTML). <span class="persona-name">Kira</span> searches them when you ask and uses them in practice sessions. Changes are picked up automatically.</p>
+        <div class="row folder-row">
+          <input id="set-folder" type="text" autocomplete="off" spellcheck="false" aria-label="Knowledge folder path">
+          <button class="btn" type="button" id="pick-folder">Choose…</button>
+          <button class="btn" type="button" id="use-folder">Use this folder</button>
+        </div>
+        <div class="row">
+          <button class="btn" type="button" id="reindex">Re-index now</button>
+          <span class="muted small" id="index-status" aria-live="polite"></span>
+        </div>
+        <ul class="index-errors" id="index-errors"></ul>
+      </section>
+      <section class="set">
+        <h2>Running locally</h2>
+        <p class="muted small" id="set-models"></p>
+      </section>
+    </div>
   </dialog>
 
   <script src="/static/markdown.js"></script>

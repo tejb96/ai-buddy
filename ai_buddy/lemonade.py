@@ -57,16 +57,21 @@ class Lemonade:
         )
         if r.status_code != 200:
             raise LemonadeError(f"Transcription failed ({r.status_code}): {r.text[:300]}")
-        return r.json().get("text", "").strip()
+        return " ".join(r.json().get("text", "").split())
 
     async def unload(self, model: str) -> None:
         await self._http.post("/unload", json={"model_name": model}, timeout=60)
 
     # ---------- LLM ----------
 
-    async def chat_stream(self, model: str, messages: list[dict], *, think: bool = False,
-                          temperature: float = 0.7, max_tokens: int = 300) -> AsyncIterator[str]:
-        """Yield content deltas. `think` is always sent: FLM keeps the last value per process."""
+    async def chat_events(self, model: str, messages: list[dict], *, tools: list[dict] | None = None,
+                          think: bool = False, temperature: float = 0.7,
+                          max_tokens: int = 300) -> AsyncIterator[dict]:
+        """Stream a completion as events: {"type": "content", "text"} while it is written, then
+        {"type": "tool_calls", "calls": [{"id", "name", "arguments"}]} if the model called tools.
+
+        `think` is always sent: FLM keeps the last value per process.
+        """
         body = {
             "model": model,
             "messages": messages,
@@ -75,6 +80,9 @@ class Lemonade:
             "temperature": temperature,
             "max_completion_tokens": max_tokens,
         }
+        if tools:
+            body["tools"] = tools
+        calls: dict[int, dict] = {}
         async with self._http.stream("POST", "/chat/completions", json=body) as r:
             if r.status_code != 200:
                 raise LemonadeError(f"Chat request failed ({r.status_code}): {(await r.aread())[:300]!r}")
@@ -88,12 +96,40 @@ class Lemonade:
                 if "error" in chunk:
                     raise LemonadeError(f"Chat stream error: {chunk['error']}")
                 for choice in chunk.get("choices", []):
-                    piece = choice.get("delta", {}).get("content")
+                    delta = choice.get("delta") or {}
+                    for tc in delta.get("tool_calls") or []:
+                        # FLM sends each call whole; OpenAI-style servers stream the arguments in pieces.
+                        call = calls.setdefault(tc.get("index", len(calls)), {"id": "", "name": "", "arguments": ""})
+                        fn = tc.get("function") or {}
+                        call["id"] = tc.get("id") or call["id"]
+                        call["name"] += fn.get("name") or ""
+                        call["arguments"] += fn.get("arguments") or ""
+                    piece = delta.get("content")
                     if piece:
-                        yield piece
+                        yield {"type": "content", "text": piece}
+        if calls:
+            yield {"type": "tool_calls", "calls": [calls[i] for i in sorted(calls)]}
+
+    async def chat_stream(self, model: str, messages: list[dict], **kw) -> AsyncIterator[str]:
+        """Yield content deltas only (no tools)."""
+        async for ev in self.chat_events(model, messages, **kw):
+            if ev["type"] == "content":
+                yield ev["text"]
 
     async def chat(self, model: str, messages: list[dict], **kw) -> str:
         return "".join([piece async for piece in self.chat_stream(model, messages, **kw)])
+
+    # ---------- embeddings ----------
+
+    async def embed(self, texts: list[str], model: str, timeout: float = 30) -> list[list[float]]:
+        r = await self._http.post("/embeddings", json={"model": model, "input": texts},
+                                  timeout=httpx.Timeout(10.0, read=timeout))
+        if r.status_code != 200:
+            raise LemonadeError(f"Embedding request failed ({r.status_code}): {r.text[:300]}")
+        data = sorted(r.json().get("data", []), key=lambda d: d.get("index", 0))
+        if len(data) != len(texts):
+            raise LemonadeError(f"Embedding request returned {len(data)} vectors for {len(texts)} inputs")
+        return [d["embedding"] for d in data]
 
     # ---------- text-to-speech ----------
 

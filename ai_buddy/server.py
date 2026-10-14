@@ -1,50 +1,122 @@
-"""FastAPI app: serves the UI, the session WebSocket, and a small REST API for history."""
+"""FastAPI app: serves the UI, the session WebSocket, and a small REST API for history and settings."""
 
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
+import os
+import shutil
+import subprocess
+import wave
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, WebSocket
-from fastapi.responses import FileResponse
+import httpx
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .config import Config
-from .lemonade import Lemonade, LemonadeError
+from .knowledge import KnowledgeBase
+from .lemonade import TTS_SAMPLE_RATE, Lemonade, LemonadeError
 from .models import ModelManager
 from .prompts import SCENARIOS
-from .session import Session
+from .session import Services, Session
+from .settings import VOICES, Settings
 from .storage import Store
+from .tools import ToolContext, ToolRegistry
 
 log = logging.getLogger(__name__)
 STATIC = Path(__file__).parent / "static"
+PREVIEW_LINE = "Hi, I'm {name}. That opening was clear and confident, but you rushed the numbers. Try pausing after each one."
+
+
+def local_timezone() -> str:
+    tz = os.environ.get("TZ", "")
+    if tz and "/" in tz:
+        return tz.lstrip(":")
+    try:
+        link = os.readlink("/etc/localtime")
+        return link.split("zoneinfo/", 1)[1]
+    except (OSError, IndexError):
+        return "UTC"
+
+
+def pcm_to_wav24(pcm: bytes) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(TTS_SAMPLE_RATE)
+        w.writeframes(pcm)
+    return buf.getvalue()
 
 
 def create_app(cfg: Config) -> FastAPI:
+    settings = Settings(cfg)
     lm = Lemonade(cfg.lemonade.base_url, cfg.lemonade.load_timeout_s)
-    models = ModelManager(lm, cfg)
-    store = Store(cfg.app.data_path)
+    models = ModelManager(lm, cfg, llm=settings.llm, voice=settings.voice)
+    store = Store(cfg.app.data_path, cfg.persona.name)
+    web = httpx.AsyncClient(timeout=httpx.Timeout(10.0), follow_redirects=True)
+    embed = None
+    if cfg.models.embed:
+        async def embed(texts: list[str]) -> list[list[float]]:
+            return await lm.embed(texts, cfg.models.embed)
+    folder = settings.knowledge_folder
+    if folder and str(folder) == os.path.expanduser(cfg.rag.folder) and not folder.exists():
+        folder.mkdir(parents=True, exist_ok=True)   # the default folder is created on first run
+    knowledge = KnowledgeBase(cfg.app.data_path / "knowledge.db", folder, chunk_chars=cfg.rag.chunk_chars,
+                              chunk_overlap=cfg.rag.chunk_overlap, max_file_mb=cfg.rag.max_file_mb,
+                              watch=cfg.rag.watch, embed=embed)
+    tools = ToolRegistry.from_config(cfg)
+    svc = Services(cfg, lm, models, store, tools, ToolContext(cfg, web, knowledge, local_timezone()), knowledge)
     allowed_origins = {f"http://{h}:{cfg.app.port}" for h in ("127.0.0.1", "localhost", cfg.app.host)}
+
+    def on_setting(key: str, value: str) -> None:
+        if key == "voice":
+            models.voice = value
+        elif key == "llm":
+            models.switch_llm(value)
+        elif key == "knowledge_folder":
+            asyncio.get_running_loop().create_task(knowledge.set_folder(settings.knowledge_folder))
+    settings.on_change(on_setting)
 
     async def warm_start():
         while True:
             try:
                 await models.prepare_live()
                 log.info("models ready: %s", models.names)
-                return
+                break
             except LemonadeError as e:
                 log.warning("waiting for Lemonade: %s", e)
                 await asyncio.sleep(5)
+        # Synthesize the tool filler lines once, so they play instantly.
+        for tool in tools.tools.values():
+            for line in tool.filler if isinstance(tool.filler, list) else [tool.filler]:
+                try:
+                    pcm = b"".join([c async for c in lm.tts_stream(line, models.names["tts"], models.voice,
+                                                                     cfg.voice.tts_speed)])
+                    svc.fillers[(models.voice, line)] = pcm
+                except LemonadeError:
+                    break
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        task = asyncio.create_task(warm_start())
+        tasks = [asyncio.create_task(warm_start()), asyncio.create_task(knowledge.start())]
         yield
-        task.cancel()
+        for t in tasks:
+            t.cancel()
+        await knowledge.close()
+        await web.aclose()
         await lm.close()
+
+    def same_origin(request: Request) -> None:
+        """Refuse state-changing requests from other web pages (there is no CORS, but simple POSTs get through)."""
+        origin = request.headers.get("origin")
+        if origin is not None and origin not in allowed_origins:
+            raise HTTPException(403, "Cross-origin request refused")
 
     app = FastAPI(title="AI Buddy", lifespan=lifespan)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", cfg.app.host])
@@ -59,9 +131,10 @@ def create_app(cfg: Config) -> FastAPI:
         return {
             "persona": cfg.persona.name,
             "models": models.names,
-            "voice": cfg.voice.tts_voice,
+            "voice": models.voice,
             "practice": vars(cfg.practice),
             "data_dir": str(cfg.app.data_path),
+            "tools": list(tools.tools),
             "scenarios": {k: {f: v[f] for f in ("title", "blurb", "placeholder", "counterpart")} for k, v in SCENARIOS.items()},
         }
 
@@ -73,6 +146,86 @@ def create_app(cfg: Config) -> FastAPI:
             pass
         return models.snapshot()
 
+    # ---------- settings ----------
+
+    def settings_view() -> dict:
+        llms = list(dict.fromkeys(cfg.models.llm_choices + [models.names["llm"]]))
+        return {"voice": models.voice, "voices": VOICES, "llm": models.names["llm"], "llms": llms,
+                "stt": models.names["stt"], "tts": models.names["tts"], "knowledge": knowledge.status(),
+                "can_pick_folder": bool(shutil.which("zenity"))}
+
+    @app.get("/api/settings")
+    async def get_settings():
+        return settings_view()
+
+    @app.post("/api/settings", dependencies=[Depends(same_origin)])
+    async def post_settings(body: dict):
+        changes = {}
+        if (voice := body.get("voice")) is not None:
+            if voice not in VOICES:
+                raise HTTPException(400, f"Unknown voice {voice!r}")
+            changes["voice"] = voice
+        if (llm := body.get("llm")) is not None:
+            if llm not in cfg.models.llm_choices and llm != models.names["llm"]:
+                raise HTTPException(400, f"{llm!r} is not in models.llm_choices")
+            changes["llm"] = llm
+        if (folder := body.get("knowledge_folder")) is not None:
+            path = Path(os.path.expanduser(str(folder).strip())) if str(folder).strip() else None
+            if path and not path.is_dir():
+                raise HTTPException(400, f"Not a folder: {path}")
+            changes["knowledge_folder"] = str(path) if path else ""
+        settings.update(**changes)
+        return settings_view()
+
+    @app.get("/api/voice/preview")
+    async def voice_preview(voice: str):
+        if voice not in VOICES:
+            raise HTTPException(400, "Unknown voice")
+        try:
+            pcm = b"".join([c async for c in lm.tts_stream(PREVIEW_LINE.format(name=cfg.persona.name),
+                                                            models.names["tts"], voice, cfg.voice.tts_speed)])
+        except LemonadeError as e:
+            raise HTTPException(503, str(e)) from e
+        return Response(pcm_to_wav24(pcm), media_type="audio/wav")
+
+    # ---------- knowledge folder ----------
+
+    @app.get("/api/knowledge")
+    async def knowledge_status():
+        return knowledge.status()
+
+    @app.post("/api/knowledge/reindex", dependencies=[Depends(same_origin)])
+    async def knowledge_reindex():
+        asyncio.get_running_loop().create_task(knowledge.reindex(force=True))
+        await asyncio.sleep(0.05)
+        return knowledge.status()
+
+    @app.post("/api/knowledge/pick", dependencies=[Depends(same_origin)])
+    async def knowledge_pick():
+        """Open GNOME's folder chooser on the desktop and return the chosen path."""
+        if not shutil.which("zenity"):
+            raise HTTPException(501, "zenity is not installed; type the folder path instead")
+        start = str(settings.knowledge_folder or Path.home()) + "/"
+        proc = await asyncio.create_subprocess_exec(
+            "zenity", "--file-selection", "--directory", f"--title=Choose {cfg.persona.name}'s knowledge folder",
+            f"--filename={start}", stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        out, _ = await proc.communicate()
+        path = out.decode().strip()
+        return {"path": path or None}
+
+    @app.post("/api/knowledge/open", dependencies=[Depends(same_origin)])
+    async def knowledge_open(body: dict):
+        """Open a source file from the knowledge folder in the default app."""
+        root = settings.knowledge_folder
+        path = Path(str(body.get("path", ""))).resolve()
+        if not root or not path.is_file() or not path.is_relative_to(root.resolve()):
+            raise HTTPException(400, "Not a file in the knowledge folder")
+        await asyncio.create_subprocess_exec("xdg-open", str(path), stdout=subprocess.DEVNULL,
+                                             stderr=subprocess.DEVNULL)
+        return {"ok": True}
+
+    # ---------- history ----------
+
     @app.get("/api/sessions")
     async def list_sessions():
         return store.list_sessions()
@@ -83,7 +236,7 @@ def create_app(cfg: Config) -> FastAPI:
             raise HTTPException(404, "No such session")
         return s
 
-    @app.delete("/api/sessions/{sid}")
+    @app.delete("/api/sessions/{sid}", dependencies=[Depends(same_origin)])
     async def delete_session(sid: str):
         store.delete_session(sid)
         return {"ok": True}
@@ -95,6 +248,6 @@ def create_app(cfg: Config) -> FastAPI:
             await ws.close(code=4403)
             return
         await ws.accept()
-        await Session(ws, cfg, lm, models, store).run()
+        await Session(ws, svc).run()
 
     return app

@@ -17,14 +17,22 @@ _STAGE_DIRECTION = re.compile(rf"\*{_STAGE_WORDS}[^*\n]{{0,30}}\*|\({_STAGE_WORD
 _EMPHASIS = re.compile(r"(\*\*|__|\*|_)(\S(?:.*?\S)?)\1")
 
 
+_UNITS = [(re.compile(r"\s?°\s?C\b"), " degrees Celsius"), (re.compile(r"\s?°\s?F\b"), " degrees Fahrenheit"),
+          (re.compile(r"\s?°"), " degrees"), (re.compile(r"\bkm/h\b"), "kilometers per hour"),
+          (re.compile(r"\bmph\b"), "miles per hour")]
+
+
 def clean_for_speech(text: str) -> str:
-    """Remove things a TTS voice should not read out: emojis, markdown, stage directions."""
+    """Remove things a TTS voice should not read out: emojis, markdown, links, stage directions."""
     text = _STAGE_DIRECTION.sub(" ", text)
+    text = re.sub(r"\[([^\]]+)\]\((?:https?://|/)[^)]*\)", r"\1", text)   # [label](url) -> label
     text = _EMPHASIS.sub(r"\2", text)
     text = _EMOJI.sub(" ", text)
-    text = re.sub(r"https?://\S+", "a link", text)
+    text = re.sub(r"\(?\s*(?:https?://|www\.)\S+?\s*\)?(?=[\s,.;!?]|$)", " ", text)
+    for pattern, spoken in _UNITS:
+        text = pattern.sub(spoken, text)
     text = re.sub(r"[*_#`>]+", " ", text)
-    text = re.sub(r"^\s*[-•]\s+", "", text, flags=re.M)
+    text = re.sub(r"^\s*(?:[-•]|\d+[.)])\s+", "", text, flags=re.M)
     text = text.replace("—", ", ").replace("–", ", ")
     text = re.sub(r"\s+", " ", text).strip()
     text = re.sub(r"\s+([,.!?;:])", r"\1", text)

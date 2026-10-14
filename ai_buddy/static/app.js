@@ -1,4 +1,4 @@
-// AI Buddy front end: microphone capture, streaming playback, and the three modes.
+// AI Buddy front end: microphone capture, streaming playback, the three modes, tools and settings.
 "use strict";
 
 const $ = (id) => document.getElementById(id);
@@ -177,7 +177,7 @@ function micError(err) {
 
 const pttMode = () => state.connected && (state.mode === "chat" || (state.mode === "interview" && state.iv.phase === "running"));
 const toggleMode = () => state.mode === "presentation";
-const serverBusy = () => ["transcribing", "thinking", "loading", "analyzing"].includes(state.server);
+const serverBusy = () => ["transcribing", "thinking", "tool", "loading", "analyzing"].includes(state.server);
 
 async function beginTalk() {
   if (state.recording) return;
@@ -192,7 +192,7 @@ async function beginTalk() {
   player.stopAll();                         // barge-in: the buddy stops talking right away
   if (state.pendingUser) { state.pendingUser.remove(); state.pendingUser = null; }
   state.recording = true;
-  net.send({ type: "rec_start" });
+  net.send(state.mode === "presentation" ? { type: "rec_start", details: $("pres-topic").value.trim() } : { type: "rec_start" });
   audio.start();
   if (state.mode === "presentation") startPresentationClock();
   render();
@@ -286,11 +286,20 @@ function onEvent(ev) {
       state.server = ev.state;
       state.detail = ev.detail || "";
       break;
+    case "user_partial":
+      showPartialUser(ev.text);
+      break;
     case "user_text":
       fillPendingUser(ev.text);
       break;
     case "reply_start":
-      if (!ev.readout) startReply(ev.id);
+      if (!ev.readout) startReply(ev.id, ev.greeting);
+      break;
+    case "tool_start":
+      onToolStart(ev);
+      break;
+    case "tool_end":
+      onToolEnd(ev);
       break;
     case "reply_delta":
       appendReply(ev.id, ev.text);
@@ -384,6 +393,11 @@ function dropPendingUser() {
   state.pendingUser = null;
 }
 
+function showPartialUser(text) {
+  if (!state.pendingUser) return;
+  state.pendingUser.querySelector(".bubble").textContent = `${text} …`;
+}
+
 function fillPendingUser(text) {
   const msg = state.pendingUser || bubble("user", "");
   msg.classList.remove("pending");
@@ -392,10 +406,59 @@ function fillPendingUser(text) {
   if (state.serverMode === "interview") state.iv.messages.push({ role: "user", text });
 }
 
-function startReply(id) {
+function startReply(id, greeting = false) {
   const msg = bubble("buddy", "", counterpart());
   msg.querySelector(".bubble").classList.add("typing");
-  state.replies.set(id, { msg, text: "" });
+  if (greeting) msg.classList.add("greeting");
+  state.replies.set(id, { msg, text: "", tools: new Map() });
+}
+
+// A tool Kira is using, shown as a line inside her message: "Searching the web · Calgary weather tomorrow".
+function onToolStart(ev) {
+  const r = state.replies.get(ev.id);
+  if (!r) return;
+  let box = r.msg.querySelector(".tools");
+  if (!box) {
+    box = el("div", { class: "tools" });
+    r.msg.querySelector(".bubble").before(box);
+  }
+  const row = el("div", { class: "tool running" }, el("span", { class: "spinner" }),
+    el("span", { class: "tool-label" }, ev.label), ev.detail ? el("span", { class: "tool-detail" }, ev.detail) : null);
+  box.append(row);
+  r.tools.set(ev.call_id, row);
+}
+
+function onToolEnd(ev) {
+  const r = state.replies.get(ev.id);
+  const row = r && r.tools.get(ev.call_id);
+  if (!row) return;
+  row.classList.remove("running");
+  row.classList.toggle("failed", !ev.ok);
+  row.querySelector(".spinner")?.remove();
+  row.prepend(el("span", { class: "tool-mark", "aria-hidden": "true" }, ev.ok ? "✓" : "!"));
+  if (ev.summary) row.append(el("span", { class: "tool-summary" }, ev.summary));
+}
+
+function sourceList(sources) {
+  if (!sources || !sources.length) return null;
+  const items = sources.slice(0, 8).map((src) => {
+    if (src.url) {
+      let host = "";
+      try { host = new URL(src.url).hostname.replace(/^www\./, ""); } catch { /* not a URL */ }
+      return el("li", {}, el("a", { href: src.url, target: "_blank", rel: "noopener noreferrer" }, src.title || host),
+        host ? el("span", { class: "muted" }, ` · ${host}`) : null);
+    }
+    return el("li", {}, el("button", { type: "button", class: "link", onclick: () => openNoteFile(src.path) }, src.title || src.path));
+  });
+  return el("details", { class: "sources" }, el("summary", {}, `Sources (${sources.length})`), el("ul", {}, items));
+}
+
+async function openNoteFile(path) {
+  try {
+    await api("/api/knowledge/open", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path }) });
+  } catch (err) {
+    toast(`Couldn't open the file: ${err.message}`, "error");
+  }
 }
 
 function appendReply(id, delta) {
@@ -412,11 +475,13 @@ function endReply(ev) {
   if (!r) return;
   const b = r.msg.querySelector(".bubble");
   b.classList.remove("typing");
-  if (!ev.text && !r.text.trim()) { r.msg.remove(); return; }
+  if (!ev.text && !r.text.trim() && !r.tools.size) { r.msg.remove(); return; }
   if (ev.interrupted) {
     b.textContent = ev.text || stripEmoji(r.text);
     r.msg.append(el("div", { class: "meta" }, "interrupted"));
   }
+  const sources = sourceList(ev.sources);
+  if (sources) r.msg.append(sources);
   if (state.serverMode === "interview") state.iv.messages.push({ role: "assistant", text: b.textContent });
 }
 
@@ -692,7 +757,8 @@ async function openSession(id) {
     el("div", { class: `msg ${t.role === "user" ? "user" : "buddy"}` },
       t.role === "user" ? null : el("div", { class: "who" }, who),
       el("div", { class: "bubble" }, t.text),
-      t.interrupted ? el("div", { class: "meta" }, "interrupted") : null)));
+      t.interrupted ? el("div", { class: "meta" }, "interrupted") : null,
+      t.meta ? sourceList(t.meta.sources) : null)));
   body.replaceChildren(
     el("div", { class: "detail-head" },
       el("div", {}, el("h1", {}, s.title), el("p", { class: "muted" }, fmtWhen(s.started_at), s.details ? ` · ${s.details}` : "",
@@ -718,10 +784,10 @@ async function deleteSession(id) {
 
 function renderModels() {
   if (!state.models) return;
-  const labels = { stt: ["Whisper", "NPU"], chat: ["Chat", "NPU"], feedback: ["Coach", "NPU"], tts: ["Voice", "CPU"] };
+  const labels = { stt: ["Whisper", "NPU"], llm: [state.config.persona, "NPU"], tts: ["Voice", "CPU"] };
   const box = $("models");
   box.replaceChildren(...Object.entries(state.models).map(([role, m]) => {
-    const [name, device] = labels[role];
+    const [name, device] = labels[role] || [role, ""];
     const note = { ready: "", loading: "loading", standby: "standby", error: "error", unknown: "…" }[m.state] ?? m.state;
     return el("span", { class: "pill", "data-state": m.state, title: `${m.name} on the ${device}: ${m.state}` },
       el("span", { class: "dot" }), name, note ? el("span", { class: "state" }, note) : null);
@@ -733,6 +799,7 @@ function statusText() {
   if (state.recording) return state.mode === "presentation" ? "Recording your talk. Press Stop when you're done." : "Listening…";
   if (state.server === "transcribing") return "Transcribing…";
   if (state.server === "thinking") return "Thinking…";
+  if (state.server === "tool") return state.detail || "Looking it up…";
   if (state.server === "loading" || state.server === "analyzing") return state.detail || "Working…";
   if (state.playing) return `${counterpart()} is talking. Press Space to interrupt.`;
   if (!state.warm) return "Warming up the models…";
@@ -797,6 +864,101 @@ function switchMode(mode) {
   render();
 }
 
+// ---------------------------------------------------------------- settings
+
+const settingsUI = {
+  data: null,
+  poll: 0,
+  async open() {
+    $("settings").showModal();
+    await this.load();
+  },
+  async load() {
+    try {
+      this.data = await api("/api/settings");
+    } catch (err) {
+      return toast(`Couldn't load settings: ${err.message}`, "error");
+    }
+    const d = this.data;
+    $("set-voice").replaceChildren(...Object.entries(d.voices).map(([id, label]) =>
+      el("option", { value: id, selected: id === d.voice }, id === "af_heart" ? `${label} — default` : label)));
+    const notes = { "qwen3.6-moe-35b-a3b-FLM": "Most accurate; starts talking in about 4–7 s.",
+      "qwen3-it-4b-FLM": "Starts talking about 3 s sooner, but makes things up more often." };
+    $("set-llm").replaceChildren(...d.llms.map((m) => el("option", { value: m, selected: m === d.llm }, m)));
+    $("set-llm-note").textContent = notes[d.llm] || "";
+    $("set-models").textContent = `Speech-to-text: ${d.stt} (NPU) · Language model: ${d.llm} (NPU) · Voice: ${d.tts} (CPU). Nothing leaves this laptop except web searches.`;
+    $("pick-folder").hidden = !d.can_pick_folder;
+    if (document.activeElement !== $("set-folder")) $("set-folder").value = d.knowledge.folder || "";
+    this.renderIndex(d.knowledge);
+  },
+  renderIndex(k) {
+    let text;
+    if (!k.folder) text = "No folder chosen.";
+    else if (!k.exists) text = "That folder doesn't exist.";
+    else if (k.indexing) text = `Indexing… ${k.files} files so far`;
+    else text = `${k.files} file${k.files === 1 ? "" : "s"}, ${k.chunks} passages indexed` +
+      (k.last_indexed ? ` · updated ${new Date(k.last_indexed).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}` : "");
+    if (k.error) text += ` · ${k.error}`;
+    $("index-status").textContent = text;
+    $("index-errors").replaceChildren(...(k.errors || []).map((e) => el("li", {}, `${e.file}: ${e.error}`)));
+    clearTimeout(this.poll);
+    if (k.indexing && $("settings").open) this.poll = setTimeout(() => this.refreshIndex(), 1000);
+  },
+  async refreshIndex() {
+    try { this.renderIndex(await api("/api/knowledge")); } catch { /* try again on the next open */ }
+  },
+  async save(body) {
+    try {
+      this.data = await api("/api/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    } catch (err) {
+      toast(`Couldn't save: ${err.message}`, "error");
+      return false;
+    }
+    await this.load();
+    return true;
+  },
+  previewVoice() {
+    const voice = $("set-voice").value;
+    const a = new Audio(`/api/voice/preview?voice=${encodeURIComponent(voice)}`);
+    a.play().catch((err) => toast(`Couldn't play the sample: ${err.message}`, "error"));
+  },
+  async pickFolder() {
+    let res;
+    try {
+      res = await api("/api/knowledge/pick", { method: "POST" });
+    } catch (err) {
+      return toast(`Couldn't open the folder chooser: ${err.message}`, "error");
+    }
+    if (res.path) {
+      $("set-folder").value = res.path;
+      if (await this.save({ knowledge_folder: res.path })) toast(`Knowledge folder set to ${res.path}`);
+    }
+  },
+  bind() {
+    $("open-settings").addEventListener("click", () => this.open());
+    $("close-settings").addEventListener("click", () => $("settings").close());
+    $("settings").addEventListener("click", (e) => { if (e.target === $("settings")) $("settings").close(); });
+    $("set-voice").addEventListener("change", (e) => this.save({ voice: e.target.value }).then((ok) => ok && this.previewVoice()));
+    $("preview-voice").addEventListener("click", () => this.previewVoice());
+    $("set-llm").addEventListener("change", async (e) => {
+      if (await this.save({ llm: e.target.value })) toast(`Switching to ${e.target.value}. It takes a few seconds to load.`);
+    });
+    $("pick-folder").addEventListener("click", () => this.pickFolder());
+    $("use-folder").addEventListener("click", async () => {
+      const path = $("set-folder").value.trim();
+      if (await this.save({ knowledge_folder: path })) toast(path ? `Knowledge folder set to ${path}` : "Knowledge folder cleared");
+    });
+    $("set-folder").addEventListener("keydown", (e) => { if (e.key === "Enter") $("use-folder").click(); });
+    $("reindex").addEventListener("click", async () => {
+      try {
+        this.renderIndex(await api("/api/knowledge/reindex", { method: "POST" }));
+      } catch (err) {
+        toast(`Couldn't re-index: ${err.message}`, "error");
+      }
+    });
+  },
+};
+
 // ---------------------------------------------------------------- toasts
 
 function toast(text, kind = "info", ms = 4500) {
@@ -831,7 +993,7 @@ function bindUI() {
 
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape" && state.playing) { cancelSpeech(); return; }
-    if (e.code !== "Space" || isTyping(e.target) || $("detail").open) return;
+    if (e.code !== "Space" || isTyping(e.target) || $("detail").open || $("settings").open) return;
     if (pttMode()) {
       e.preventDefault();
       if (!e.repeat) beginTalk();
@@ -862,6 +1024,7 @@ async function main() {
   document.querySelectorAll(".persona-name").forEach((e) => { e.textContent = state.config.persona; });
   buildScenarios();
   bindUI();
+  settingsUI.bind();
   let saved = "chat";
   try { saved = localStorage.getItem("ai-buddy-mode") || "chat"; } catch { /* storage unavailable */ }
   state.mode = null;

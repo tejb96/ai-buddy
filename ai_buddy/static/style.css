@@ -126,6 +126,12 @@ button { font: inherit; color: inherit; }
 .pill[data-state="error"] { color: var(--critical); }
 .pill[data-state="error"] .dot { background: var(--critical); }
 .pill .state { color: var(--muted); }
+.icon-btn {
+  display: grid; place-items: center; width: 34px; height: 34px; border-radius: 10px; flex: none;
+  border: 1px solid var(--border); background: var(--surface); cursor: pointer; color: var(--ink-2);
+}
+.icon-btn:hover { background: var(--surface-2); color: var(--ink); }
+.icon-btn svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
 @keyframes blink { 50% { opacity: 0.25; } }
 
 /* ---------- main ---------- */
@@ -147,7 +153,26 @@ main { max-width: 860px; margin: 0 auto; padding: 28px 20px 230px; }
 .msg.buddy { align-self: flex-start; }
 .msg.buddy .bubble { border-bottom-left-radius: 6px; }
 .msg .meta { font-size: 11.5px; color: var(--muted); margin: 3px 6px 0; }
-.msg.pending .bubble { color: var(--muted); }
+.msg.pending .bubble { color: color-mix(in srgb, var(--accent-ink) 78%, transparent); }
+.msg.greeting .bubble { color: var(--ink-2); }
+.tools { display: flex; flex-direction: column; gap: 3px; margin: 0 4px 5px; }
+.tool { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--ink-2); min-width: 0; }
+.tool .spinner { width: 12px; height: 12px; border-width: 1.5px; }
+.tool-mark { color: var(--good); font-weight: 700; width: 12px; text-align: center; }
+.tool.failed .tool-mark { color: var(--critical); }
+.tool-label { font-weight: 600; white-space: nowrap; }
+.tool-detail { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.tool-detail::before { content: "· "; }
+.tool-summary { color: var(--muted); white-space: nowrap; }
+.tool-summary::before { content: "· "; }
+details.sources { font-size: 12.5px; margin: 4px 6px 0; color: var(--ink-2); }
+details.sources summary { cursor: pointer; color: var(--muted); }
+details.sources ul { margin: 4px 0 2px; padding-left: 18px; }
+details.sources li { margin: 2px 0; overflow-wrap: anywhere; }
+details.sources a { color: var(--accent); text-decoration: none; }
+details.sources a:hover { text-decoration: underline; }
+.link { background: none; border: 0; padding: 0; color: var(--accent); cursor: pointer; text-align: left; font-size: inherit; }
+.link:hover { text-decoration: underline; }
 .typing::after { content: "▍"; animation: blink 1s steps(1) infinite; margin-left: 1px; }
 
 /* ---------- presentation ---------- */
@@ -260,6 +285,20 @@ dialog.detail {
 dialog.detail::backdrop { background: rgba(0, 0, 0, 0.35); }
 .detail-body { padding: 22px 24px; }
 .detail-head { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; margin-bottom: 14px; }
+dialog.settings { width: min(640px, calc(100vw - 32px)); }
+.set { padding: 14px 0; border-top: 1px solid var(--hairline); }
+.set h2 { margin-bottom: 8px; }
+.set .row + .row { margin-top: 8px; }
+.small { font-size: 13px; }
+.set p.small { margin: 6px 0 8px; }
+.set select, .folder-row input {
+  font: inherit; padding: 8px 10px; border-radius: 10px; border: 1px solid var(--border);
+  background: var(--page); color: var(--ink); min-width: 0;
+}
+.set select { max-width: 100%; }
+.folder-row input { flex: 1 1 260px; }
+.index-errors { margin: 6px 0 0; padding-left: 18px; font-size: 12.5px; color: var(--critical); }
+.index-errors:empty { display: none; }
 
 /* ---------- dock ---------- */
 .dock {

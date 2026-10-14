@@ -1,8 +1,9 @@
 """Keep the right models loaded in Lemonade and report their state to the UI.
 
-FastFlowLM in Lemonade has a single LLM slot: loading the feedback LLM evicts the chat LLM
-(and vice versa). Whisper (transcription) and Kokoro (TTS) live in their own slots and stay put.
-Models are loaded explicitly so our context sizes apply (an implicit load would use the 64k default).
+One LLM (by default qwen3.6-moe-35b-a3b-FLM) does everything: conversation, tool calls and coaching,
+so nothing is swapped. Whisper (speech-to-text) runs in its own FLM process on the NPU and Kokoro
+(TTS) on the CPU. Models are loaded explicitly so our context size applies (an implicit load would
+use Lemonade's 64k default).
 """
 
 from __future__ import annotations
@@ -19,15 +20,15 @@ from .lemonade import Lemonade, LemonadeError
 
 log = logging.getLogger(__name__)
 
-ROLES = ("stt", "chat", "feedback", "tts")
+ROLES = ("stt", "llm", "tts")
 
 
 class ModelManager:
-    def __init__(self, lm: Lemonade, cfg: Config):
+    def __init__(self, lm: Lemonade, cfg: Config, llm: str | None = None, voice: str | None = None):
         self.lm = lm
         self.cfg = cfg
-        self.names = {r: getattr(cfg.models, r) for r in ROLES}
-        self.ctx = {"chat": cfg.models.chat_ctx_size, "feedback": cfg.models.feedback_ctx_size}
+        self.names = {"stt": cfg.models.stt, "llm": llm or cfg.models.llm, "tts": cfg.models.tts}
+        self.voice = voice or cfg.voice.tts_voice
         self.state = {r: "unknown" for r in ROLES}
         self.error: str | None = None
         self.warm = False
@@ -78,6 +79,7 @@ class ModelManager:
 
     async def ensure(self, *roles: str) -> None:
         """Make sure the models for `roles` are loaded (cheap when they already are)."""
+        roles = roles or ROLES
         loaded = await self.refresh()
         if all(self.names[r] in loaded for r in roles):
             return
@@ -88,7 +90,7 @@ class ModelManager:
                     continue
                 self._set(role, "loading")
                 try:
-                    await self.lm.load(self.names[role], self.ctx.get(role))
+                    await self.lm.load(self.names[role], self.cfg.models.llm_ctx_size if role == "llm" else None)
                 except LemonadeError as e:
                     self.error = str(e)
                     self._set(role, "error")
@@ -98,19 +100,26 @@ class ModelManager:
                 loaded = await self.refresh()
 
     async def prepare_live(self) -> None:
-        """Load and warm up everything a live conversation needs."""
-        await self.ensure("stt", "tts", "chat")
+        """Load and warm up everything a conversation needs."""
+        await self.ensure("stt", "tts", "llm")
         await self.warm_up()
         self.warm = True
         self._notify()
 
     async def warm_up(self) -> None:
         try:
-            await self.lm.chat(self.names["chat"], [{"role": "user", "content": "Hi"}], think=False, max_tokens=1)
-            async for _ in self.lm.tts_stream("Hi.", self.names["tts"], self.cfg.voice.tts_voice):
+            await self.lm.chat(self.names["llm"], [{"role": "user", "content": "Hi"}], think=False, max_tokens=1)
+            async for _ in self.lm.tts_stream("Hi.", self.names["tts"], self.voice):
                 pass
         except LemonadeError as e:
             log.warning("warm-up failed: %s", e)
+
+    def switch_llm(self, name: str) -> asyncio.Task:
+        """Use a different LLM from now on (loading it evicts the old one)."""
+        self.names["llm"] = name
+        self.state["llm"] = "standby"
+        self._notify()
+        return self.ensure_in_background("llm")
 
     async def transcribe(self, pcm: bytes) -> str:
         """Speech-to-text with one retry. Calls are serialized: FLM runs one ASR job at a time anyway,

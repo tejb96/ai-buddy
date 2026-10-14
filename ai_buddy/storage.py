@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS turns (
     text TEXT NOT NULL,
     at TEXT NOT NULL,
     audio_s REAL,
-    interrupted INTEGER DEFAULT 0
+    interrupted INTEGER DEFAULT 0,
+    meta_json TEXT                  -- tools Kira used and the sources she read
 );
 CREATE INDEX IF NOT EXISTS turns_session ON turns(session_id, id);
 """
@@ -44,13 +45,17 @@ def _now() -> str:
 
 
 class Store:
-    def __init__(self, data_dir: Path):
+    def __init__(self, data_dir: Path, assistant_name: str = "Kira"):
         self.dir = data_dir
+        self.assistant_name = assistant_name
         (data_dir / "sessions").mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(data_dir / "buddy.db", check_same_thread=False)
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA foreign_keys = ON")
         self._db.executescript(SCHEMA)
+        if "meta_json" not in {r[1] for r in self._db.execute("PRAGMA table_info(turns)")}:
+            self._db.execute("ALTER TABLE turns ADD COLUMN meta_json TEXT")   # databases from before tools
+            self._db.commit()
         self._lock = threading.Lock()
 
     def _exec(self, sql: str, args: tuple = ()) -> sqlite3.Cursor:
@@ -66,9 +71,10 @@ class Store:
         return sid
 
     def add_turn(self, session_id: str, role: str, text: str, audio_s: float | None = None,
-                 interrupted: bool = False) -> None:
-        self._exec("INSERT INTO turns (session_id, role, text, at, audio_s, interrupted) VALUES (?,?,?,?,?,?)",
-                   (session_id, role, text, _now(), audio_s, int(interrupted)))
+                 interrupted: bool = False, meta: dict | None = None) -> None:
+        self._exec("INSERT INTO turns (session_id, role, text, at, audio_s, interrupted, meta_json) "
+                   "VALUES (?,?,?,?,?,?,?)", (session_id, role, text, _now(), audio_s, int(interrupted),
+                                              json.dumps(meta) if meta else None))
 
     def finish_session(self, session_id: str, *, duration_s: float | None = None, metrics: dict | None = None,
                        feedback_md: str | None = None, feedback_model: str | None = None) -> Path | None:
@@ -98,9 +104,12 @@ class Store:
         out["metrics"] = json.loads(row["metrics_json"]) if row["metrics_json"] else None
         out["feedback_md"] = row["feedback_md"]
         out["feedback_model"] = row["feedback_model"]
-        out["turns"] = [dict(t) for t in self._exec(
-            "SELECT role, text, at, audio_s, interrupted FROM turns WHERE session_id=? ORDER BY id",
-            (session_id,)).fetchall()]
+        out["turns"] = []
+        for t in self._exec("SELECT role, text, at, audio_s, interrupted, meta_json FROM turns WHERE session_id=? "
+                            "ORDER BY id", (session_id,)).fetchall():
+            turn = dict(t)
+            turn["meta"] = json.loads(turn.pop("meta_json")) if t["meta_json"] else None
+            out["turns"].append(turn)
         out["user_turns"] = sum(1 for t in out["turns"] if t["role"] == "user")
         return out
 
@@ -127,10 +136,10 @@ class Store:
     def export_markdown(self, session_id: str) -> Path:
         s = self.get_session(session_id)
         assert s is not None
-        counterpart = SCENARIOS.get(s["scenario"] or "", {}).get("counterpart", "Buddy")
+        counterpart = SCENARIOS.get(s["scenario"] or "", {}).get("counterpart", self.assistant_name)
         lines = [f"# {s['title']}: {s['started_at'].replace('T', ' ')}", ""]
         if s["details"]:
-            lines += [f"*Scenario:* {s['details']}", ""]
+            lines += [f"*{'Topic' if s['mode'] == 'presentation' else 'Scenario'}:* {s['details']}", ""]
         m = s["metrics"]
         if m:
             f, p = m["fillers"], m["pauses"]
@@ -146,6 +155,10 @@ class Store:
         for t in s["turns"]:
             who = "You" if t["role"] == "user" else counterpart
             lines.append(f"**{who}:** {t['text']}{' *(interrupted)*' if t['interrupted'] else ''}")
+            for src in (t["meta"] or {}).get("sources", []):
+                where = src.get("url") or src.get("path") or ""
+                lines.append(f"  - Source: [{src.get('title') or where}]({where})" if src.get("url")
+                             else f"  - Source: {src.get('title') or where}")
             lines.append("")
         path = self.dir / "sessions" / f"{session_id}.md"
         path.write_text("\n".join(lines))

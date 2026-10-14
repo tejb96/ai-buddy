@@ -20,25 +20,38 @@ class LemonadeCfg:
 @dataclass
 class ModelsCfg:
     stt: str = "whisper-v3-turbo-FLM"
-    chat: str = "qwen3-it-4b-FLM"
-    feedback: str = "qwen3.6-moe-35b-a3b-FLM"
+    llm: str = "qwen3.6-moe-35b-a3b-FLM"
     tts: str = "kokoro-v1"
-    chat_ctx_size: int = 8192
-    feedback_ctx_size: int = 16384
+    llm_ctx_size: int = 32768
+    # Optional embedding model for semantic note search; empty = keyword search only (see README).
+    embed: str = ""
+    # LLMs offered in the settings panel.
+    llm_choices: list[str] = field(default_factory=lambda: ["qwen3.6-moe-35b-a3b-FLM", "qwen3-it-4b-FLM"])
 
 
 @dataclass
 class ChatCfg:
-    temperature: float = 0.7
-    max_tokens: int = 200
-    history_word_budget: int = 3500
+    temperature: float = 0.6
+    max_tokens: int = 300
+    # Drop the oldest turns when the conversation history gets longer than this many words.
+    history_word_budget: int = 8000
+    greet: bool = True
+    timeout_s: float = 90
 
 
 @dataclass
 class FeedbackCfg:
     think: bool = False
-    max_tokens: int = 1200
+    max_tokens: int = 1500
     temperature: float = 0.4
+
+
+@dataclass
+class SttCfg:
+    # Long push-to-talk turns are transcribed in chunks while you talk, cut in pauses.
+    live_chunk_s: float = 15
+    live_chunk_max_s: float = 25
+    live_pause_s: float = 0.5
 
 
 @dataclass
@@ -50,8 +63,37 @@ class VoiceCfg:
 
 @dataclass
 class PersonaCfg:
-    name: str = "Sunny"
-    style: str = "warm, curious, upbeat, and a little playful"
+    name: str = "Kira"
+    style: str = "warm, encouraging and honest"
+
+
+@dataclass
+class ToolsCfg:
+    enabled: list[str] = field(default_factory=lambda: ["web_search", "fetch_page", "get_datetime", "calculate",
+                                                        "search_notes"])
+    max_calls_per_turn: int = 3
+    timeout_s: float = 15
+    plugin_dir: str = ""
+    search_backend: str = "duckduckgo"
+    searxng_url: str = ""
+    search_results: int = 5
+    pages_to_read: int = 2
+    page_chars: int = 1500
+    fetch_timeout_s: float = 6
+
+
+@dataclass
+class RagCfg:
+    folder: str = "~/Documents/ai-buddy-notes"
+    watch: bool = True
+    chunk_chars: int = 1200
+    chunk_overlap: int = 200
+    top_k: int = 4
+    max_file_mb: float = 20
+
+    @property
+    def folder_path(self) -> Path | None:
+        return Path(os.path.expanduser(self.folder)) if self.folder else None
 
 
 @dataclass
@@ -81,8 +123,11 @@ class Config:
     models: ModelsCfg = field(default_factory=ModelsCfg)
     chat: ChatCfg = field(default_factory=ChatCfg)
     feedback: FeedbackCfg = field(default_factory=FeedbackCfg)
+    stt: SttCfg = field(default_factory=SttCfg)
     voice: VoiceCfg = field(default_factory=VoiceCfg)
     persona: PersonaCfg = field(default_factory=PersonaCfg)
+    tools: ToolsCfg = field(default_factory=ToolsCfg)
+    rag: RagCfg = field(default_factory=RagCfg)
     practice: PracticeCfg = field(default_factory=PracticeCfg)
     app: AppCfg = field(default_factory=AppCfg)
 
