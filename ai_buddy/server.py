@@ -22,11 +22,12 @@ from .config import Config
 from .knowledge import KnowledgeBase
 from .lemonade import TTS_SAMPLE_RATE, Lemonade, LemonadeError
 from .models import ModelManager
-from .prompts import SCENARIOS
 from .session import Services, Session
 from .settings import VOICES, Settings
+from .skills import SkillSet
+from .skills.mcp import McpManager
 from .storage import Store
-from .tools import ToolContext, ToolRegistry
+from .tools import ToolContext
 
 log = logging.getLogger(__name__)
 STATIC = Path(__file__).parent / "static"
@@ -58,29 +59,49 @@ def create_app(cfg: Config) -> FastAPI:
     settings = Settings(cfg)
     lm = Lemonade(cfg.lemonade.base_url, cfg.lemonade.load_timeout_s)
     models = ModelManager(lm, cfg, llm=settings.llm, voice=settings.voice)
-    store = Store(cfg.app.data_path, cfg.persona.name)
+    skills = SkillSet.from_config(cfg, settings.skills)
+    mcp = McpManager(cfg, skills)
+    coach = skills.skills.get("speaking-coach")
+    scenarios = coach.modules["modes"].SCENARIOS if coach and "modes" in coach.modules else {}
+    store = Store(cfg.app.data_path, cfg.persona.name, scenarios)
     web = httpx.AsyncClient(timeout=httpx.Timeout(10.0), follow_redirects=True)
-    embed = None
-    if cfg.models.embed:
-        async def embed(texts: list[str]) -> list[list[float]]:
-            return await lm.embed(texts, cfg.models.embed)
     folder = settings.knowledge_folder
     if folder and str(folder) == os.path.expanduser(cfg.rag.folder) and not folder.exists():
         folder.mkdir(parents=True, exist_ok=True)   # the default folder is created on first run
     knowledge = KnowledgeBase(cfg.app.data_path / "knowledge.db", folder, chunk_chars=cfg.rag.chunk_chars,
                               chunk_overlap=cfg.rag.chunk_overlap, max_file_mb=cfg.rag.max_file_mb,
-                              watch=cfg.rag.watch, embed=embed)
-    tools = ToolRegistry.from_config(cfg)
-    svc = Services(cfg, lm, models, store, tools, ToolContext(cfg, web, knowledge, local_timezone()), knowledge)
+                              watch=cfg.rag.watch, embed=models.embed if cfg.models.embed else None,
+                              embed_model=cfg.models.embed)
+    svc = Services(cfg, lm, models, store, skills, ToolContext(cfg, web, knowledge, local_timezone()), knowledge)
     allowed_origins = {f"http://{h}:{cfg.app.port}" for h in ("127.0.0.1", "localhost", cfg.app.host)}
+    notes_running = False
+
+    async def sync_notes() -> None:
+        """Index the knowledge folder (and watch it) only while the notes skill is on."""
+        nonlocal notes_running
+        if skills.is_enabled("notes") and not notes_running:
+            notes_running = True
+            await knowledge.start()
+        elif not skills.is_enabled("notes") and notes_running:
+            notes_running = False
+            await knowledge.close()
+
+    def on_skills() -> None:
+        svc.skills_changed()
+        loop = asyncio.get_running_loop()
+        loop.create_task(mcp.sync())
+        loop.create_task(sync_notes())
+    skills.on_change(on_skills)
 
     def on_setting(key: str, value: str) -> None:
         if key == "voice":
             models.voice = value
         elif key == "llm":
             models.switch_llm(value)
-        elif key == "knowledge_folder":
+        elif key == "knowledge_folder" and notes_running:
             asyncio.get_running_loop().create_task(knowledge.set_folder(settings.knowledge_folder))
+        elif key == "knowledge_folder":
+            knowledge.folder = settings.knowledge_folder
     settings.on_change(on_setting)
 
     async def warm_start():
@@ -93,7 +114,7 @@ def create_app(cfg: Config) -> FastAPI:
                 log.warning("waiting for Lemonade: %s", e)
                 await asyncio.sleep(5)
         # Synthesize the tool filler lines once, so they play instantly.
-        for tool in tools.tools.values():
+        for tool in svc.tools.tools.values():
             for line in tool.filler if isinstance(tool.filler, list) else [tool.filler]:
                 try:
                     pcm = b"".join([c async for c in lm.tts_stream(line, models.names["tts"], models.voice,
@@ -104,10 +125,11 @@ def create_app(cfg: Config) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        tasks = [asyncio.create_task(warm_start()), asyncio.create_task(knowledge.start())]
+        tasks = [asyncio.create_task(warm_start()), asyncio.create_task(sync_notes()), asyncio.create_task(mcp.sync())]
         yield
         for t in tasks:
             t.cancel()
+        await mcp.close()
         await knowledge.close()
         await web.aclose()
         await lm.close()
@@ -126,17 +148,39 @@ def create_app(cfg: Config) -> FastAPI:
     async def index():
         return FileResponse(STATIC / "index.html", headers={"Cache-Control": "no-cache"})
 
-    @app.get("/api/config")
-    async def get_config():
+    def config_view() -> dict:
         return {
             "persona": cfg.persona.name,
             "models": models.names,
             "voice": models.voice,
             "practice": vars(cfg.practice),
             "data_dir": str(cfg.app.data_path),
-            "tools": list(tools.tools),
-            "scenarios": {k: {f: v[f] for f in ("title", "blurb", "placeholder", "counterpart")} for k, v in SCENARIOS.items()},
+            "tools": list(svc.tools.tools),
+            "skills": skills.view(),
+            "modes": ["chat"] + skills.modes(),
+            "scenarios": {k: {f: v[f] for f in ("title", "blurb", "placeholder", "counterpart")}
+                          for k, v in scenarios.items()},
         }
+
+    @app.get("/api/config")
+    async def get_config():
+        return config_view()
+
+    # ---------- skills ----------
+
+    @app.get("/api/skills")
+    async def get_skills():
+        return skills.view()
+
+    @app.post("/api/skills", dependencies=[Depends(same_origin)])
+    async def post_skills(body: dict):
+        name, on = str(body.get("name", "")), body.get("enabled")
+        if name not in skills.skills or not isinstance(on, bool):
+            raise HTTPException(400, "Expected {name: <a skill>, enabled: true|false}")
+        settings.set_skill(name, on)
+        skills.set_enabled(name, on)
+        await asyncio.sleep(0)      # let an MCP server start connecting before answering
+        return config_view()
 
     @app.get("/api/status")
     async def get_status():
@@ -151,7 +195,8 @@ def create_app(cfg: Config) -> FastAPI:
     def settings_view() -> dict:
         llms = list(dict.fromkeys(cfg.models.llm_choices + [models.names["llm"]]))
         return {"voice": models.voice, "voices": VOICES, "llm": models.names["llm"], "llms": llms,
-                "stt": models.names["stt"], "tts": models.names["tts"], "knowledge": knowledge.status(),
+                "stt": models.names["stt"], "tts": models.names["tts"], "embed": models.names.get("embed"),
+                "hears_audio": models.hears_audio(), "knowledge": knowledge.status(), "skills": skills.view(),
                 "can_pick_folder": bool(shutil.which("zenity"))}
 
     @app.get("/api/settings")

@@ -1,4 +1,5 @@
-"""Choices made in the UI (voice, model, knowledge folder), saved in <data_dir>/settings.json.
+"""Choices made in the UI (voice, model, knowledge folder, which skills are on), saved in
+<data_dir>/settings.json.
 
 They start from config.toml and override it once changed in the settings panel.
 """
@@ -36,10 +37,13 @@ class Settings:
         self.cfg = cfg
         self.path = cfg.app.data_path / "settings.json"
         self.values = {"voice": cfg.voice.tts_voice, "llm": cfg.models.llm, "knowledge_folder": cfg.rag.folder}
+        self.skills: dict[str, bool] = {}    # skill switches flipped in the app (override skills.enabled)
         self._listeners: list[Callable[[str, str], None]] = []
         try:
             saved = json.loads(self.path.read_text())
             self.values.update({k: v for k, v in saved.items() if k in self.KEYS and isinstance(v, str)})
+            if isinstance(saved.get("skills"), dict):
+                self.skills = {k: v for k, v in saved["skills"].items() if isinstance(k, str) and isinstance(v, bool)}
         except FileNotFoundError:
             pass
         except (OSError, ValueError) as e:
@@ -66,10 +70,17 @@ class Settings:
         if not changed:
             return
         self.values.update(changed)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.values, indent=2))
-        tmp.replace(self.path)
+        self._save()
         for key, value in changed.items():
             for fn in self._listeners:
                 fn(key, value)
+
+    def set_skill(self, name: str, on: bool) -> None:
+        self.skills[name] = on
+        self._save()
+
+    def _save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({**self.values, "skills": self.skills}, indent=2))
+        tmp.replace(self.path)

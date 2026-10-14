@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import re
 from datetime import date, datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
-from . import Tool, ToolContext, ToolResult
+from ai_buddy.tools import Tool, ToolContext, ToolResult
 
 # Common places without a zone of their own.
 ALIASES = {
@@ -39,6 +40,48 @@ def resolve_zone(name: str) -> ZoneInfo | None:
     return None
 
 
+# "what time is it", "what's the time", "the current time"; not "what time is the meeting"
+_TIME_Q = re.compile(r"\bwhat(?:'s| is)? the (?:current |local )?time\b(?! (?:of|for|on|at|when|difference|zone)\b)"
+                     r"|\bwhat time(?: is it|'s it| it is)\b|\btime is it\b|\bcurrent time\b(?! (?:difference|zone)\b)",
+                     re.I)
+_PLACE = re.compile(r"\b(?:in|for|at|to|from|visiting)\s+(?:the\s+)?(?P<place>[A-Za-z][\w'.-]*(?:\s+[A-Za-z][\w'.-]*){0,2})")
+_UNTIL = re.compile(r"\bhow (?:many|much) (?:more )?(?:days|weeks|time)\b[^?.!]*?\b(?:until|till|til|before|to)\s+"
+                    r"(?P<what>[^?.!,]+)", re.I)
+HOLIDAYS = {"christmas eve": (12, 24), "christmas": (12, 25), "boxing day": (12, 26), "new year's eve": (12, 31),
+            "new years eve": (12, 31), "new year's": (1, 1), "new years": (1, 1), "new year": (1, 1),
+            "halloween": (10, 31), "valentine's day": (2, 14), "valentines day": (2, 14), "canada day": (7, 1),
+            "independence day": (7, 4)}
+MONTHS = {m: i for i, m in enumerate("january february march april may june july august september october november "
+                                     "december".split(), 1)}
+
+
+def place_zone(text: str) -> ZoneInfo | None:
+    """The zone of a place named in `text` ("in New York right now" -> America/New_York), trying the longest
+    phrase first."""
+    for m in _PLACE.finditer(text):
+        words = m["place"].split()
+        for n in range(len(words), 0, -1):
+            if zone := resolve_zone(" ".join(words[:n])):
+                return zone
+    return None
+
+
+def target_date(what: str, today: date) -> date | None:
+    """'Christmas' -> the next Dec 25; 'October 30th' -> that date (next year if it has passed)."""
+    key = what.strip().lower().removeprefix("the ").strip()
+    month_day = HOLIDAYS.get(key)
+    if month_day is None:
+        if m := re.match(r"(?P<m>[a-z]+)\s+(?P<d>\d{1,2})(?:st|nd|rd|th)?\b", key):
+            month_day = (MONTHS[m["m"]], int(m["d"])) if m["m"] in MONTHS else None
+    if month_day is None:
+        return None
+    try:
+        d = date(today.year, *month_day)
+        return d if d >= today else date(today.year + 1, *month_day)
+    except ValueError:
+        return None
+
+
 def describe_time(now: datetime) -> dict:
     return {"date": now.strftime("%A, %B %-d, %Y"), "time": now.strftime("%-I:%M %p"),
             "iso": now.isoformat(timespec="minutes"), "timezone": str(now.tzinfo)}
@@ -58,6 +101,21 @@ class DateTime(Tool):
 
     def describe(self, args: dict) -> str:
         return args.get("timezone") or ""
+
+    def route(self, text: str, ctx: ToolContext) -> dict | None:
+        if m := _UNTIL.search(text):
+            target = target_date(m["what"], ctx.today())
+            return {"until": target.isoformat()} if target else None
+        if not (q := _TIME_Q.search(text)):
+            return None
+        after = text[q.end():]
+        if _PLACE.search(after):
+            zone = place_zone(after)
+            return {"timezone": str(zone)} if zone else None   # a place we can't place: let the model ask
+        if re.search(r"\bthere\b", after, re.I):
+            zone = place_zone(text[:q.start()])     # "the weather in Paris, and what time is it there?"
+            return {"timezone": str(zone)} if zone else None
+        return {}
 
     async def run(self, args: dict, ctx: ToolContext) -> ToolResult:
         local = ZoneInfo(ctx.timezone)

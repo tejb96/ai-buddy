@@ -38,8 +38,15 @@ class Lemonade:
     async def loaded_models(self) -> dict[str, dict]:
         return {m["model_name"]: m for m in (await self.health()).get("all_models_loaded", [])}
 
-    async def load(self, model: str, ctx_size: int | None = None) -> None:
-        body: dict = {"model_name": model}
+    async def models(self) -> dict[str, dict]:
+        """The models Lemonade knows (downloaded or not), with their labels ("audio", "embeddings"...)."""
+        r = await self._http.get("/models", params={"show_all": "true"}, timeout=10)
+        r.raise_for_status()
+        return {m["id"]: m for m in r.json().get("data", [])}
+
+    async def load(self, model: str, ctx_size: int | None = None, **options) -> None:
+        """Load a model; `options` are Lemonade recipe options for this load only (e.g. llamacpp_backend)."""
+        body: dict = {"model_name": model, **options}
         if ctx_size:
             body["ctx_size"] = ctx_size
         r = await self._http.post("/load", json=body, timeout=self.load_timeout_s)

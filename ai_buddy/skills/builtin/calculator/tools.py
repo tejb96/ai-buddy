@@ -5,8 +5,9 @@ from __future__ import annotations
 import ast
 import math
 import operator
+import re
 
-from . import Tool, ToolContext, ToolResult
+from ai_buddy.tools import Tool, ToolContext, ToolResult
 
 _BINARY = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.Div: operator.truediv,
            ast.FloorDiv: operator.floordiv, ast.Mod: operator.mod, ast.Pow: operator.pow}
@@ -22,8 +23,8 @@ class CalcError(ValueError):
 
 
 def evaluate(expression: str) -> float | int:
-    text = (expression.replace("×", "*").replace("÷", "/").replace("^", "**").replace("−", "-")
-            .replace(",", "").strip())
+    text = expression.replace("×", "*").replace("÷", "/").replace("^", "**").replace("−", "-").strip()
+    text = re.sub(r"(?<=\d),(?=\d{3}\b)", "", text)    # thousands separators ("1,250"), not argument commas
     if len(text) > 300:
         raise CalcError("expression too long")
     try:
@@ -68,6 +69,20 @@ def tidy(value) -> float | int:
     return value
 
 
+_NUM = r"\$?\d[\d,]*(?:\.\d+)?"
+# Whole questions only ("what's 18% of 240?", "what is 12 times 37"), so "I got 18% of the votes" isn't one.
+_PERCENT_Q = re.compile(rf"^(?:what(?:'s| is)|how much is|calculate|work out)\s+(?P<p>{_NUM})\s*(?:%|percent)\s+of\s+"
+                        rf"(?P<n>{_NUM})\s*[?.!]?$", re.I)
+_BINARY_Q = re.compile(rf"^(?:what(?:'s| is)|how much is|calculate|work out)\s+(?P<a>{_NUM})\s+(?P<op>times|x|"
+                       rf"multiplied by|plus|minus|divided by|over)\s+(?P<b>{_NUM})\s*[?.!]?$", re.I)
+_OPS = {"times": "*", "x": "*", "multiplied by": "*", "plus": "+", "minus": "-", "divided by": "/", "over": "/"}
+_LEAD = re.compile(r"^\s*(?:(?:um|uh|so|okay|ok|quick one|hey kira|kira)[,:.\s]+)+", re.I)
+
+
+def _n(text: str) -> str:
+    return text.replace("$", "").replace(",", "")
+
+
 class Calculator(Tool):
     name = "calculate"
     description = ("Evaluate an arithmetic expression exactly, e.g. '137.50 * 1.15 / 4' or 'sqrt(729 * 3)'. Supports "
@@ -79,6 +94,15 @@ class Calculator(Tool):
 
     def describe(self, args: dict) -> str:
         return args.get("expression", "")
+
+    def route(self, text: str, ctx: ToolContext) -> dict | None:
+        q = _LEAD.sub("", text.strip())
+        q = re.sub(r"^.*?[.!:]\s+(?=(?:what|how|calculate|work)\b)", "", q, flags=re.I)  # "Okay. Quick one: what's..."
+        if m := _PERCENT_Q.match(q):
+            return {"expression": f"{_n(m['p'])} / 100 * {_n(m['n'])}"}
+        if m := _BINARY_Q.match(q):
+            return {"expression": f"{_n(m['a'])} {_OPS[m['op'].lower()]} {_n(m['b'])}"}
+        return None
 
     async def run(self, args: dict, ctx: ToolContext) -> ToolResult:
         expr = str(args["expression"])

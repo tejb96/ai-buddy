@@ -2,7 +2,15 @@
 
 from __future__ import annotations
 
-from . import Tool, ToolContext, ToolResult
+import re
+
+from ai_buddy.tools import Tool, ToolContext, ToolResult
+
+# "What does my resume say about...", "Remind me what I wrote about the budget", "my talking points for..."
+_MINE = re.compile(r"\b(?:my|in my|from my)\s+(?:own\s+)?(?:notes?|résumé|resume|cv|talking points|documents?|"
+                   r"knowledge folder)\b|\bwhat (?:did )?i (?:wrote|write|noted|jotted)\b", re.I)
+_ASKING = re.compile(r"^\s*(?:(?:um|uh|so|okay|ok|hey kira|kira)[,\s]+)*(?:what|which|where|when|who|how|remind|find|"
+                     r"check|look|search|tell|show|read|pull|get|does|did|do|is|are|can|could|would)\b|\?\s*$", re.I)
 
 
 class SearchNotes(Tool):
@@ -16,6 +24,12 @@ class SearchNotes(Tool):
 
     def describe(self, args: dict) -> str:
         return args.get("topic", "")
+
+    def route(self, text: str, ctx: ToolContext) -> dict | None:
+        if ctx.knowledge is None or not _MINE.search(text) or not _ASKING.search(text):
+            return None
+        topic = re.sub(r"^\s*(?:(?:um|uh|so|okay|ok|hey kira|kira)[,\s]+)+", "", text.strip(), flags=re.I)
+        return {"topic": topic.rstrip("?.! ")}
 
     async def run(self, args: dict, ctx: ToolContext) -> ToolResult:
         kb = ctx.knowledge

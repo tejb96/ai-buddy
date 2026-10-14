@@ -2,9 +2,12 @@
 
 Pipeline: walk the folder -> extract text (Markdown/text, PDF via pypdf, DOCX, HTML) -> split into
 ~1200-character chunks along headings and paragraphs, with overlap -> store in SQLite with an FTS5
-(BM25) index -> re-index files whose size or modification time changed, when the folder changes
-(watchfiles) or on request. Optionally, chunk embeddings from an embedding model served by Lemonade
-are added for semantic search and fused with BM25 (reciprocal rank fusion).
+(BM25) index and an embedding per chunk -> re-index files whose size or modification time changed, when
+the folder changes (watchfiles) or on request.
+
+Search is hybrid: the embedding model (Qwen3-Embedding-0.6B on llama.cpp's CPU backend, through Lemonade)
+finds passages by meaning, BM25 finds exact names and numbers ("Henderson", "Q3"), and the two rankings are
+fused (reciprocal rank fusion). Without an embedding model it falls back to keywords alone.
 """
 
 from __future__ import annotations
@@ -108,7 +111,7 @@ def extract(path: Path) -> tuple[list[tuple[str, int | None]], bool]:
     if suffix == ".docx":
         return [(_docx_text(path), None)], True
     if suffix in (".html", ".htm"):
-        from .tools._web import html_to_text
+        from .web import html_to_text
         _, text = html_to_text(path.read_text(errors="replace"))
         return [(text, None)], False
     return [(path.read_text(errors="replace"), None)], suffix in (".md", ".markdown") or suffix == ""
@@ -214,16 +217,34 @@ def keywords(text: str, n: int = 12) -> str:
 
 Embed = Callable[[list[str]], Awaitable[list[list[float]]]]
 
+# How each embedding model family wants its inputs (query template, document template).
+EMBED_FORMATS = {
+    # Qwen3-Embedding: an instruction on the query side only; documents are embedded as they are.
+    "qwen3-embedding": ("Instruct: Given a question about the user's own notes, retrieve the passages that answer "
+                        "it\nQuery:{query}", "{title}\n{text}"),
+    # nomic-embed-text v1/v1.5: a task prefix on both sides.
+    "nomic-embed-text": ("search_query: {query}", "search_document: {title}\n{text}"),
+}
+
+
+def embed_format(model: str) -> tuple[str, str]:
+    key = model.lower()
+    return next((fmt for family, fmt in EMBED_FORMATS.items() if family in key), ("{query}", "{title}\n{text}"))
+
 
 class KnowledgeBase:
     def __init__(self, db_path: Path, folder: Path | None, *, chunk_chars: int = 1200, chunk_overlap: int = 200,
-                 max_file_mb: float = 20, watch: bool = True, embed: Embed | None = None):
+                 max_file_mb: float = 20, watch: bool = True, embed: Embed | None = None, embed_model: str = ""):
         self.folder = folder
         self.chunk_chars, self.chunk_overlap = chunk_chars, chunk_overlap
         self.max_bytes = int(max_file_mb * 1024 * 1024)
         self.watch = watch
         self.embed = embed
+        self.embed_model = embed_model
+        self.query_fmt, self.doc_fmt = embed_format(embed_model)
         self.embed_state = "off" if embed is None else "pending"
+        self._matrix: tuple[int, np.ndarray, np.ndarray] | None = None   # (version, chunk ids, vectors)
+        self._version = 0
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(db_path, check_same_thread=False)
         self._db.execute("PRAGMA foreign_keys = ON")
@@ -297,6 +318,7 @@ class KnowledgeBase:
                 try:
                     await asyncio.to_thread(self._scan, force)
                     if self.embed is not None:
+                        self._check_embed_model()
                         await self._embed_missing()
                 except Exception as e:
                     log.exception("indexing failed")
@@ -317,6 +339,7 @@ class KnowledgeBase:
             row = self._db.execute("SELECT value FROM meta WHERE key='folder'").fetchone()
             if not row or row[0] != str(folder):
                 self._db.executescript("DELETE FROM chunks_fts; DELETE FROM chunks; DELETE FROM files;")
+                self._version += 1
                 self._db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('folder', ?)", (str(folder),))
                 self._db.commit()
         if not folder or not folder.is_dir():
@@ -347,6 +370,7 @@ class KnowledgeBase:
         self._db.execute("DELETE FROM chunks_fts WHERE rowid IN (SELECT id FROM chunks WHERE file_id=?)", (fid,))
         self._db.execute("DELETE FROM chunks WHERE file_id=?", (fid,))
         self._db.execute("DELETE FROM files WHERE id=?", (fid,))
+        self._version += 1
 
     def _index_file(self, path: Path, st: os.stat_result, old_id: int | None) -> None:
         error, chunks = None, []
@@ -376,18 +400,35 @@ class KnowledgeBase:
         if error:
             log.info("not indexed %s: %s", path, error)
 
+    def _check_embed_model(self) -> None:
+        """Vectors from another embedding model don't compare: drop them so they're recomputed."""
+        with self._lock:
+            row = self._db.execute("SELECT value FROM meta WHERE key='embed_model'").fetchone()
+            if not row or row[0] != self.embed_model:
+                self._db.execute("UPDATE chunks SET vec=NULL")
+                self._db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('embed_model', ?)",
+                                 (self.embed_model,))
+                self._db.commit()
+                self._version += 1
+        if self.embed_state.startswith("unavailable"):
+            self.embed_state = "pending"      # try again on every scan (the model may have been loading)
+
+    def _doc_text(self, text: str, heading: str, path: str) -> str:
+        title = Path(path).stem.replace("_", " ").replace("-", " ") + (f" › {heading}" if heading else "")
+        return self.doc_fmt.format(title=title, text=text)
+
     async def _embed_missing(self, batch: int = 16) -> None:
         if self.embed_state.startswith("unavailable"):
             return
+        self.embed_state = "indexing"
         while True:
             rows = self._query("SELECT c.id, c.text, c.heading, f.path FROM chunks c JOIN files f ON f.id = c.file_id "
                                "WHERE c.vec IS NULL LIMIT ?", (batch,))
             if not rows:
                 self.embed_state = "ready"
                 return
-            texts = [f"title: {Path(p).stem}{' › ' + h if h else ''} | text: {t}" for _, t, h, p in rows]
             try:
-                vecs = await self.embed(texts)
+                vecs = await self.embed([self._doc_text(t, h, p) for _, t, h, p in rows])
             except Exception as e:
                 self.embed_state = f"unavailable ({e})"
                 log.warning("embeddings unavailable, using keyword search only: %s", e)
@@ -398,6 +439,7 @@ class KnowledgeBase:
                     a /= np.linalg.norm(a) + 1e-9
                     self._db.execute("UPDATE chunks SET vec=? WHERE id=?", (a.tobytes(), cid))
                 self._db.commit()
+                self._version += 1
 
     # ---------- status & search ----------
 
@@ -405,18 +447,20 @@ class KnowledgeBase:
         files, chunks = self._query("SELECT COUNT(*), COALESCE(SUM(chunks), 0) FROM files")[0]
         errors = [{"file": str(Path(p).relative_to(self.folder)) if self.folder and p.startswith(str(self.folder)) else p,
                    "error": e} for p, e in self._query("SELECT path, error FROM files WHERE error IS NOT NULL LIMIT 5")]
+        embedded = self._query("SELECT COUNT(*) FROM chunks WHERE vec IS NOT NULL")[0][0]
         return {"folder": str(self.folder) if self.folder else None,
                 "exists": bool(self.folder and self.folder.is_dir()), "files": files, "chunks": chunks,
                 "indexing": self.indexing, "last_indexed": self.last_indexed, "error": self.last_error,
-                "errors": errors, "embeddings": self.embed_state}
+                "errors": errors, "embeddings": self.embed_state, "embed_model": self.embed_model or None,
+                "embedded_chunks": embedded}
 
     async def search(self, query: str, k: int = 4) -> list[Hit]:
         ranked = await asyncio.to_thread(self._bm25, query, max(k * 4, 20))
-        if self.embed is not None and self.embed_state == "ready":
+        if self.embed is not None and self.embed_state in ("ready", "indexing"):
             try:
-                qv = np.asarray((await self.embed([f"task: search result | query: {query}"]))[0], dtype=np.float32)
+                qv = np.asarray((await self.embed([self.query_fmt.format(query=query)]))[0], dtype=np.float32)
                 dense = await asyncio.to_thread(self._dense, qv, max(k * 4, 20))
-                ranked = rrf([ranked, dense])
+                ranked = rrf([ranked, dense]) if ranked else dense
             except Exception as e:
                 log.warning("embedding search failed, using keywords only: %s", e)
         return await asyncio.to_thread(self._hits, ranked[:k])
@@ -430,13 +474,18 @@ class KnowledgeBase:
         return [(cid, -score) for cid, score in rows]
 
     def _dense(self, qv: np.ndarray, limit: int) -> list[tuple[int, float]]:
-        rows = self._query("SELECT id, vec FROM chunks WHERE vec IS NOT NULL")
-        if not rows:
+        if self._matrix is None or self._matrix[0] != self._version:
+            rows = self._query("SELECT id, vec FROM chunks WHERE vec IS NOT NULL")
+            ids = np.array([r[0] for r in rows], dtype=np.int64)
+            mat = (np.frombuffer(b"".join(v for _, v in rows), dtype=np.float32).reshape(len(rows), -1) if rows
+                   else np.zeros((0, len(qv)), dtype=np.float32))
+            self._matrix = (self._version, ids, mat)
+        _, ids, mat = self._matrix
+        if not len(ids) or mat.shape[1] != len(qv):
             return []
-        mat = np.frombuffer(b"".join(v for _, v in rows), dtype=np.float32).reshape(len(rows), -1)
         sims = mat @ (qv / (np.linalg.norm(qv) + 1e-9))
         order = np.argsort(-sims)[:limit]
-        return [(rows[i][0], float(sims[i])) for i in order]
+        return [(int(ids[i]), float(sims[i])) for i in order]
 
     def _hits(self, ranked: list[tuple[int, float]]) -> list[Hit]:
         out = []

@@ -301,6 +301,12 @@ function onEvent(ev) {
     case "tool_end":
       onToolEnd(ev);
       break;
+    case "confirm_request":
+      onConfirmRequest(ev);
+      break;
+    case "confirm_end":
+      onConfirmEnd(ev);
+      break;
     case "reply_delta":
       appendReply(ev.id, ev.text);
       break;
@@ -437,6 +443,31 @@ function onToolEnd(ev) {
   row.querySelector(".spinner")?.remove();
   row.prepend(el("span", { class: "tool-mark", "aria-hidden": "true" }, ev.ok ? "✓" : "!"));
   if (ev.summary) row.append(el("span", { class: "tool-summary" }, ev.summary));
+}
+
+// A skill that changes something asks first: a card with the question, answered by voice or with the buttons.
+function onConfirmRequest(ev) {
+  const r = state.replies.get(ev.id);
+  if (!r) return;
+  const answer = (allow) => net.send({ type: "confirm", call_id: ev.call_id, allow });
+  const card = el("div", { class: "confirm", "data-call": ev.call_id },
+    el("div", { class: "confirm-q" }, ev.text),
+    el("div", { class: "confirm-detail muted small" }, `${ev.skill} · ${ev.tool}`),
+    el("div", { class: "row" },
+      el("button", { type: "button", class: "btn primary", onclick: () => answer(true) }, "Yes, go ahead"),
+      el("button", { type: "button", class: "btn", onclick: () => answer(false) }, "No")),
+    el("div", { class: "muted small" }, "Or hold Space and say yes or no."));
+  r.msg.append(card);
+  card.scrollIntoView({ block: "end", behavior: "smooth" });
+}
+
+function onConfirmEnd(ev) {
+  const card = document.querySelector(`.confirm[data-call="${CSS.escape(ev.call_id)}"]`);
+  if (!card) return;
+  card.querySelector(".row")?.remove();
+  card.querySelector(".muted.small:last-child")?.remove();
+  card.classList.add(ev.allowed ? "allowed" : "declined");
+  card.append(el("div", { class: "confirm-result" }, ev.allowed ? "✓ You said yes" : "✕ You said no"));
 }
 
 function sourceList(sources) {
@@ -784,7 +815,8 @@ async function deleteSession(id) {
 
 function renderModels() {
   if (!state.models) return;
-  const labels = { stt: ["Whisper", "NPU"], llm: [state.config.persona, "NPU"], tts: ["Voice", "CPU"] };
+  const labels = { stt: ["Whisper", "NPU"], llm: [state.config.persona, "NPU"], tts: ["Voice", "CPU"],
+    embed: ["Notes search", "CPU"] };
   const box = $("models");
   box.replaceChildren(...Object.entries(state.models).map(([role, m]) => {
     const [name, device] = labels[role] || [role, ""];
@@ -800,6 +832,7 @@ function statusText() {
   if (state.server === "transcribing") return "Transcribing…";
   if (state.server === "thinking") return "Thinking…";
   if (state.server === "tool") return state.detail || "Looking it up…";
+  if (state.server === "confirm") return "Waiting for your answer: say yes or no, or use the buttons.";
   if (state.server === "loading" || state.server === "analyzing") return state.detail || "Working…";
   if (state.playing) return `${counterpart()} is talking. Press Space to interrupt.`;
   if (!state.warm) return "Warming up the models…";
@@ -838,6 +871,22 @@ function setToggleLabel(btn, text) {
   if (!text) { label?.remove(); return; }
   if (!label) { label = el("span", { class: "label" }); btn.insertBefore(label, btn.querySelector(".ring")); }
   label.textContent = text;
+}
+
+// Practice tabs come from the speaking-coach skill; the empty chat says what the enabled skills can do.
+const SKILL_PHRASES = { "web-search": "look things up online", notes: "check your notes", calculator: "do the math",
+  clock: "tell the time", "speaking-coach": "coach you through a talk or an interview" };
+
+function applySkills() {
+  const modes = new Set(state.config.modes || ["chat"]);
+  for (const b of document.querySelectorAll(".tabs button")) {
+    if (b.dataset.mode !== "history") b.hidden = !modes.has(b.dataset.mode);
+  }
+  const on = state.config.skills.filter((s) => s.enabled && s.status === "ready");
+  const phrases = on.map((s) => SKILL_PHRASES[s.name] || `use ${s.label}`);
+  const list = phrases.length > 1 ? `${phrases.slice(0, -1).join(", ")} and ${phrases.at(-1)}` : phrases[0];
+  $("chat-skills-line").textContent = list ? `I can ${list}.` : "Every skill is switched off; turn some on in Settings.";
+  if (state.mode && state.mode !== "history" && !modes.has(state.mode)) switchMode("chat");
 }
 
 function switchMode(mode) {
@@ -882,14 +931,47 @@ const settingsUI = {
     const d = this.data;
     $("set-voice").replaceChildren(...Object.entries(d.voices).map(([id, label]) =>
       el("option", { value: id, selected: id === d.voice }, id === "af_heart" ? `${label} — default` : label)));
-    const notes = { "qwen3.6-moe-35b-a3b-FLM": "Most accurate; starts talking in about 4–7 s.",
-      "qwen3-it-4b-FLM": "Starts talking about 3 s sooner, but makes things up more often." };
+    const notes = { "gemma4-it-12b-FLM": "Hears your voice directly; the most reliable with tools.",
+      "qwen3.6-moe-35b-a3b-FLM": "Reads Whisper's transcript; accurate, needs more memory (22 GB).",
+      "qwen3-it-4b-FLM": "Starts talking sooner, but makes things up more often." };
     $("set-llm").replaceChildren(...d.llms.map((m) => el("option", { value: m, selected: m === d.llm }, m)));
     $("set-llm-note").textContent = notes[d.llm] || "";
-    $("set-models").textContent = `Speech-to-text: ${d.stt} (NPU) · Language model: ${d.llm} (NPU) · Voice: ${d.tts} (CPU). Nothing leaves this laptop except web searches.`;
+    $("set-models").textContent = `Language model: ${d.llm} (NPU${d.hears_audio ? ", hears your voice" : ""}) · ` +
+      `Speech-to-text: ${d.stt} (NPU) · Voice: ${d.tts} (CPU)` + (d.embed ? ` · Notes search: ${d.embed} (CPU)` : "") +
+      ". Nothing leaves this laptop except web searches and the MCP servers you connect.";
+    this.renderSkills(d.skills);
     $("pick-folder").hidden = !d.can_pick_folder;
     if (document.activeElement !== $("set-folder")) $("set-folder").value = d.knowledge.folder || "";
     this.renderIndex(d.knowledge);
+  },
+  renderSkills(skills) {
+    const status = (s) => s.status === "error" ? `Couldn't connect: ${s.error}` :
+      s.status === "starting" ? "Connecting…" : s.source === "mcp" && s.enabled && s.status === "off" ? "Not connected" : "";
+    $("set-skills").replaceChildren(...skills.map((s) => {
+      const asks = s.tools.filter((t) => t.confirm).length;
+      const input = el("input", { type: "checkbox", checked: s.enabled, "aria-label": `${s.label} on or off` });
+      input.addEventListener("change", () => this.toggleSkill(s.name, input.checked, input));
+      return el("li", { class: "skill", "data-status": s.status },
+        el("label", { class: "switch" }, input, el("span", { class: "slider", "aria-hidden": "true" })),
+        el("div", { class: "skill-body" },
+          el("div", { class: "skill-name" }, s.label,
+            s.source !== "built-in" ? el("span", { class: "tag" }, s.source === "mcp" ? "MCP" : "yours") : null,
+            asks ? el("span", { class: "tag asks", title: "Asks you before it changes anything" }, "asks first") : null),
+          el("div", { class: "muted small" }, s.description),
+          status(s) ? el("div", { class: "small skill-status" }, status(s)) : null));
+    }));
+  },
+  async toggleSkill(name, on, input) {
+    try {
+      state.config = await api("/api/skills", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, enabled: on }) });
+    } catch (err) {
+      input.checked = !on;
+      return toast(`Couldn't switch that skill: ${err.message}`, "error");
+    }
+    applySkills();
+    this.renderSkills(state.config.skills);
+    if (state.config.skills.some((s) => s.status === "starting")) setTimeout(() => this.load(), 1500);
   },
   renderIndex(k) {
     let text;
@@ -899,10 +981,17 @@ const settingsUI = {
     else text = `${k.files} file${k.files === 1 ? "" : "s"}, ${k.chunks} passages indexed` +
       (k.last_indexed ? ` · updated ${new Date(k.last_indexed).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}` : "");
     if (k.error) text += ` · ${k.error}`;
+    if (k.folder && k.exists && k.chunks) {
+      const e = k.embeddings || "off";
+      text += e === "ready" ? " · search by meaning and keywords" :
+        e === "indexing" || e === "pending" ? ` · understanding them (${k.embedded_chunks || 0}/${k.chunks})…` :
+        e === "off" ? " · keyword search only" : " · keyword search only (the embedding model isn't available)";
+    }
     $("index-status").textContent = text;
     $("index-errors").replaceChildren(...(k.errors || []).map((e) => el("li", {}, `${e.file}: ${e.error}`)));
     clearTimeout(this.poll);
-    if (k.indexing && $("settings").open) this.poll = setTimeout(() => this.refreshIndex(), 1000);
+    const busy = k.indexing || (k.chunks && ["indexing", "pending"].includes(k.embeddings));
+    if (busy && $("settings").open) this.poll = setTimeout(() => this.refreshIndex(), 1000);
   },
   async refreshIndex() {
     try { this.renderIndex(await api("/api/knowledge")); } catch { /* try again on the next open */ }
@@ -1028,7 +1117,9 @@ async function main() {
   let saved = "chat";
   try { saved = localStorage.getItem("ai-buddy-mode") || "chat"; } catch { /* storage unavailable */ }
   state.mode = null;
-  switchMode(["chat", "presentation", "interview", "history"].includes(saved) ? saved : "chat");
+  const usable = [...(state.config.modes || ["chat"]), "history"];
+  switchMode(usable.includes(saved) ? saved : "chat");
+  applySkills();
   net.connect();
 }
 

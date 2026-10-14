@@ -15,10 +15,13 @@ tts = "kokoro-v1"                       # text-to-speech (CPU)
 llm_ctx_size = 32768
 # Models offered in the settings panel. qwen3-it-4b-FLM starts talking ~3 s sooner but makes up answers more often.
 llm_choices = ["qwen3.6-moe-35b-a3b-FLM", "qwen3-it-4b-FLM"]
-# Optional embedding model for semantic note search (keyword search is always on). Leave empty on
-# Lemonade 2026.41.1 / FLM 1.0.6: embed-gemma-300m-FLM hangs there, and loading it next to the 35B and
-# Whisper makes Lemonade unload every model. See README.
+# Embedding model for note search, run by llama.cpp on the CPU; search then combines meaning and keywords.
+# "" = keywords only. Changing it re-embeds the notes. NOT SET UP YET (see docs/phase0-findings.md, "Start
+# here"): first `lemonade backends install llamacpp:cpu` and `lemonade pull Qwen3-Embedding-0.6B-GGUF`,
+# check that it loads on the CPU, then set embed = "Qwen3-Embedding-0.6B-GGUF".
 embed = ""
+embed_backend = "cpu"
+embed_threads = 4                       # leaves CPU cores free for Kokoro
 
 [chat]
 temperature = 0.6
@@ -28,6 +31,11 @@ history_word_budget = 8000
 # Kira writes a short greeting when a chat starts; it also preloads the model's prompt cache.
 greet = true
 timeout_s = 90                # give up on a reply that takes longer than this
+# With an LLM that hears audio (gemma4-it-12b-FLM), send your recording to it directly instead of Whisper's text.
+audio_input = true
+# Where your chat bubble's transcript comes from with audio input: "whisper" (transcribed alongside the reply)
+# or "heard" (the LLM writes what it heard before replying). Practice modes always use Whisper.
+transcript = "whisper"
 
 [feedback]
 # Lets the model "think" before writing feedback: deeper, but 30 s or more slower.
@@ -51,12 +59,28 @@ language = "en"
 name = "Kira"
 style = "warm, encouraging and honest"
 
+[user]
+location = ""                 # e.g. "Calgary, Alberta": Kira assumes it when you don't name a place
+
+[skills]
+# Every capability is a skill (Agent Skills format: a folder with SKILL.md; built-ins in ai_buddy/skills/builtin).
+# Switch skills on or off here or in the app (gear icon); the app's switches take precedence.
+enabled = ["web-search", "notes", "clock", "calculator", "speaking-coach"]
+dirs = []                     # folders with your own skills
+confirm_timeout_s = 60        # skills that change things ask first; no answer within this = no
+
+# MCP servers become skills too (add the name to skills.enabled, or switch it on in the app). Kira asks before
+# every tool call unless the server marks the tool read-only or it's listed in auto_approve. Example:
+# [mcp.servers.files]
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "/home/me/Documents/kira-files"]
+# description = "Read and write files in ~/Documents/kira-files"
+# auto_approve = ["read_file", "list_directory"]
+# (or url = "http://127.0.0.1:8000/mcp" for a server that's already running)
+
 [tools]
-# Tools are plugins in ai_buddy/tools/ (one file each). Remove a name to switch that tool off.
-enabled = ["web_search", "fetch_page", "get_datetime", "calculate", "search_notes"]
 max_calls_per_turn = 3
 timeout_s = 15                # per tool call
-plugin_dir = ""               # optional folder with your own single-file tool plugins
 search_backend = "duckduckgo" # "duckduckgo" (no key needed) or "searxng"
 searxng_url = ""              # e.g. "http://localhost:8888" for a self-hosted SearXNG with JSON output enabled
 search_results = 5

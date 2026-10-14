@@ -20,7 +20,7 @@
       <button role="tab" data-mode="history">History</button>
     </nav>
     <div class="models" id="models" aria-label="Model status"></div>
-    <button class="icon-btn" id="open-settings" type="button" aria-label="Settings" title="Voice, model and knowledge folder">
+    <button class="icon-btn" id="open-settings" type="button" aria-label="Settings" title="Voice, model, skills and knowledge folder">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.03 1.56V21a2 2 0 1 1-4 0v-.09A1.7 1.7 0 0 0 8.9 19.4a1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-1.56-1.03H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.6 8.9a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 8.96 4.6 1.7 1.7 0 0 0 10 3.04V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1.03 1.56 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V9c.26.6.85 1 1.51 1H21a2 2 0 1 1 0 4h-.09c-.66 0-1.25.4-1.51 1Z"/></svg>
     </button>
   </header>
@@ -31,7 +31,7 @@
         <div class="empty" id="chat-empty">
           <h1>Hi! I'm <span class="persona-name">Kira</span>.</h1>
           <p>Hold <kbd>Space</kbd> (or the button below) while you talk, then let go. Press <kbd>Space</kbd> again any time to cut me off.</p>
-          <p class="muted">I can look things up online, check your notes, do the math and tell the time.</p>
+          <p class="muted" id="chat-skills-line"></p>
         </div>
       </div>
     </section>
@@ -130,6 +130,11 @@
         <h2>Model</h2>
         <div class="row"><select id="set-llm" aria-label="Language model"></select></div>
         <p class="muted small" id="set-llm-note"></p>
+      </section>
+      <section class="set">
+        <h2>Skills</h2>
+        <p class="muted small">Everything <span class="persona-name">Kira</span> can do is a skill. Skills that change something outside the chat (files, messages, programs) ask you before they act.</p>
+        <ul class="skills" id="set-skills"></ul>
       </section>
       <section class="set">
         <h2>Knowledge folder</h2>

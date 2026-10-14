@@ -15,13 +15,25 @@ import time
 import urllib.request
 from pathlib import Path
 
+import sys
+
 import numpy as np
 import pytest
 import uvicorn
 import websockets
 
-from ai_buddy.config import load_config
+from ai_buddy.config import McpServerCfg, load_config
 from ai_buddy.server import create_app
+
+FIXTURES = Path(__file__).parent / "fixtures"
+NOTES = {
+    "work/henderson-pitch.md": "# Henderson project: talking points\n- Open with the Henderson ops team story: they "
+                               "saved ten hours a week after switching to automated reports.\n- Numbers: revenue up "
+                               "12% quarter over quarter, churn down to 3%, NPS 61.\n- Ask: a two-year renewal.\n",
+    "resume.md": "# Resume\n## Experience\nData analyst at Prairie Health (2021-2026): Python ETL pipelines with "
+                 "pandas, and a FastAPI service for dashboards.\n",
+    "personal/budget.md": "# Budget notes\nRent is 1,650 a month. Groceries target 500, eating out capped at 150.\n",
+}
 
 LEMONADE = "http://localhost:13305/v1"
 _speech_cache: dict[tuple[str, str], bytes] = {}
@@ -70,11 +82,21 @@ def free_port() -> int:
 
 @pytest.fixture(scope="session")
 def server(tmp_path_factory):
+    """The real app on the configured models, with a sample knowledge folder and a test MCP server (a to-do list
+    whose add_item tool asks before it acts)."""
     data = tmp_path_factory.mktemp("data")
+    notes = tmp_path_factory.mktemp("notes")
+    for rel, text in NOTES.items():
+        (notes / rel).parent.mkdir(parents=True, exist_ok=True)
+        (notes / rel).write_text(text)
     cfg = load_config(Path(__file__).parent.parent / "config.toml")
     cfg.app.data_dir = str(data)
     cfg.app.port = free_port()
     cfg.app.open_window = False
+    cfg.rag.folder = str(notes)
+    cfg.mcp.servers = {"todo": McpServerCfg(command=sys.executable, description="The user's to-do list",
+                                            args=[str(FIXTURES / "mcp_notes_server.py"), str(data / "todo.txt")])}
+    cfg.skills.enabled = cfg.skills.enabled + ["todo"]
     srv = uvicorn.Server(uvicorn.Config(create_app(cfg), host="127.0.0.1", port=cfg.app.port, log_level="warning"))
     thread = threading.Thread(target=srv.run, daemon=True)
     thread.start()
@@ -90,7 +112,7 @@ def server(tmp_path_factory):
         time.sleep(1)
     else:
         pytest.fail("models never became ready")
-    yield {"base": base, "ws": f"ws://127.0.0.1:{cfg.app.port}/ws", "cfg": cfg, "data": data}
+    yield {"base": base, "ws": f"ws://127.0.0.1:{cfg.app.port}/ws", "cfg": cfg, "data": data, "notes": notes}
     srv.should_exit = True
     thread.join(timeout=10)
 

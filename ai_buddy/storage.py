@@ -9,8 +9,6 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-from .prompts import SCENARIOS
-
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
@@ -45,9 +43,10 @@ def _now() -> str:
 
 
 class Store:
-    def __init__(self, data_dir: Path, assistant_name: str = "Kira"):
+    def __init__(self, data_dir: Path, assistant_name: str = "Kira", scenarios: dict[str, dict] | None = None):
         self.dir = data_dir
         self.assistant_name = assistant_name
+        self.scenarios = scenarios or {}     # practice scenarios (titles, counterparts) from the coach skill
         (data_dir / "sessions").mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(data_dir / "buddy.db", check_same_thread=False)
         self._db.row_factory = sqlite3.Row
@@ -118,12 +117,11 @@ class Store:
         self._exec("DELETE FROM sessions WHERE id=?", (session_id,))
         (self.dir / "sessions" / f"{session_id}.md").unlink(missing_ok=True)
 
-    @staticmethod
-    def _summary(r: sqlite3.Row) -> dict:
+    def _summary(self, r: sqlite3.Row) -> dict:
         m = json.loads(r["metrics_json"]) if r["metrics_json"] else None
         title = MODE_TITLES.get(r["mode"], r["mode"])
         if r["scenario"]:
-            title = SCENARIOS.get(r["scenario"], {}).get("title", r["scenario"])
+            title = self.scenarios.get(r["scenario"], {}).get("title", r["scenario"])
         return {
             "id": r["id"], "mode": r["mode"], "scenario": r["scenario"], "details": r["details"],
             "title": title, "started_at": r["started_at"], "ended_at": r["ended_at"],
@@ -136,7 +134,7 @@ class Store:
     def export_markdown(self, session_id: str) -> Path:
         s = self.get_session(session_id)
         assert s is not None
-        counterpart = SCENARIOS.get(s["scenario"] or "", {}).get("counterpart", self.assistant_name)
+        counterpart = self.scenarios.get(s["scenario"] or "", {}).get("counterpart", self.assistant_name)
         lines = [f"# {s['title']}: {s['started_at'].replace('T', ' ')}", ""]
         if s["details"]:
             lines += [f"*{'Topic' if s['mode'] == 'presentation' else 'Scenario'}:* {s['details']}", ""]

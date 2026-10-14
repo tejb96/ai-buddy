@@ -1,16 +1,23 @@
 """Keep the right models loaded in Lemonade and report their state to the UI.
 
-One LLM (by default qwen3.6-moe-35b-a3b-FLM) does everything: conversation, tool calls and coaching,
-so nothing is swapped. Whisper (speech-to-text) runs in its own FLM process on the NPU and Kokoro
-(TTS) on the CPU. Models are loaded explicitly so our context size applies (an implicit load would
-use Lemonade's 64k default).
+One LLM does everything: conversation, tool calls and coaching, so nothing is swapped. Whisper
+(speech-to-text) runs in its own FLM process on the NPU and Kokoro (TTS) on the CPU. The embedding model
+for note search runs on llama.cpp's CPU backend and is loaded the first time the notes need it. Models are
+loaded explicitly so our options apply (an implicit load would use Lemonade's defaults: a 64k context, and
+whatever llama.cpp backend is the default).
+
+One NPU job at a time: when Whisper and the LLM (two FLM processes) run at the same moment, both results come
+back corrupted (an empty reply after a minute, "What? What? What?" from Whisper; FLM 1.0.6). Loaded side by
+side they're fine. So every Whisper call and every LLM stream goes through one lock, and LLM streams are
+always closed when abandoned (FLM stops generating as soon as the client disconnects).
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 
 import httpx
 
@@ -20,7 +27,7 @@ from .lemonade import Lemonade, LemonadeError
 
 log = logging.getLogger(__name__)
 
-ROLES = ("stt", "llm", "tts")
+ROLES = ("stt", "llm", "tts")      # what a conversation needs; "embed" (notes) is loaded on demand
 
 
 class ModelManager:
@@ -28,19 +35,32 @@ class ModelManager:
         self.lm = lm
         self.cfg = cfg
         self.names = {"stt": cfg.models.stt, "llm": llm or cfg.models.llm, "tts": cfg.models.tts}
+        if cfg.models.embed:
+            self.names["embed"] = cfg.models.embed
         self.voice = voice or cfg.voice.tts_voice
-        self.state = {r: "unknown" for r in ROLES}
+        self.state = {r: "unknown" for r in self.names}
+        self.labels: dict[str, list[str]] = {}       # model -> Lemonade labels, filled by refresh_labels()
         self.error: str | None = None
         self.warm = False
         self._lock = asyncio.Lock()
-        self._stt_lock = asyncio.Lock()
+        self._npu = asyncio.Lock()      # one FLM job (Whisper or LLM) at a time
         self._listeners: set[Callable[[dict], None]] = set()
 
     # ---------- status ----------
 
     def snapshot(self) -> dict:
-        return {"models": {r: {"name": self.names[r], "state": self.state[r]} for r in ROLES},
-                "error": self.error, "warm": self.warm}
+        return {"models": {r: {"name": self.names[r], "state": self.state[r]} for r in self.names},
+                "error": self.error, "warm": self.warm, "hears_audio": self.hears_audio()}
+
+    async def refresh_labels(self) -> None:
+        try:
+            self.labels = {k: v.get("labels") or [] for k, v in (await self.lm.models()).items()}
+        except (LemonadeError, httpx.HTTPError) as e:
+            log.warning("couldn't read Lemonade's model list: %s", e)
+
+    def hears_audio(self) -> bool:
+        """Whether the chat LLM takes audio input (gemma4 models) and the config wants it used."""
+        return self.cfg.chat.audio_input and "audio" in self.labels.get(self.names["llm"], [])
 
     def subscribe(self, fn: Callable[[dict], None]) -> None:
         self._listeners.add(fn)
@@ -64,12 +84,12 @@ class ModelManager:
             loaded = await self.lm.loaded_models()
         except LemonadeError as e:
             self.error = str(e)
-            for r in ROLES:
+            for r in self.names:
                 self.state[r] = "error"
             self._notify()
             raise
         self.error = None
-        for r in ROLES:
+        for r in self.names:
             if self.state[r] != "loading":
                 self.state[r] = "ready" if self.names[r] in loaded else "standby"
         self._notify()
@@ -90,7 +110,8 @@ class ModelManager:
                     continue
                 self._set(role, "loading")
                 try:
-                    await self.lm.load(self.names[role], self.cfg.models.llm_ctx_size if role == "llm" else None)
+                    await self.lm.load(self.names[role], self.cfg.models.llm_ctx_size if role == "llm" else None,
+                                       **self._options(role))
                 except LemonadeError as e:
                     self.error = str(e)
                     self._set(role, "error")
@@ -99,8 +120,20 @@ class ModelManager:
                 self.state[role] = "ready"
                 loaded = await self.refresh()
 
+    def _options(self, role: str) -> dict:
+        if role != "embed":
+            return {}
+        m = self.cfg.models
+        return {"llamacpp_backend": m.embed_backend, "llamacpp_args": f"--threads {m.embed_threads}"}
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        """Embeddings for note search (loads the embedding model on the CPU first if needed)."""
+        await self.ensure("embed")
+        return await self.lm.embed(texts, self.names["embed"])
+
     async def prepare_live(self) -> None:
         """Load and warm up everything a conversation needs."""
+        await self.refresh_labels()
         await self.ensure("stt", "tts", "llm")
         await self.warm_up()
         self.warm = True
@@ -108,7 +141,8 @@ class ModelManager:
 
     async def warm_up(self) -> None:
         try:
-            await self.lm.chat(self.names["llm"], [{"role": "user", "content": "Hi"}], think=False, max_tokens=1)
+            async with self._npu:
+                await self.lm.chat(self.names["llm"], [{"role": "user", "content": "Hi"}], think=False, max_tokens=1)
             async for _ in self.lm.tts_stream("Hi.", self.names["tts"], self.voice):
                 pass
         except LemonadeError as e:
@@ -121,12 +155,25 @@ class ModelManager:
         self._notify()
         return self.ensure_in_background("llm")
 
+    async def llm_events(self, messages: list[dict], **kw) -> AsyncIterator[dict]:
+        """The chat LLM's streamed events (see Lemonade.chat_events), holding the NPU while it runs.
+        Use it with contextlib.aclosing() so an abandoned stream releases the NPU at once."""
+        async with self._npu:
+            async with contextlib.aclosing(self.lm.chat_events(self.names["llm"], messages, **kw)) as events:
+                async for ev in events:
+                    yield ev
+
+    async def llm_text(self, messages: list[dict], **kw) -> AsyncIterator[str]:
+        async with contextlib.aclosing(self.llm_events(messages, **kw)) as events:
+            async for ev in events:
+                if ev["type"] == "content":
+                    yield ev["text"]
+
     async def transcribe(self, pcm: bytes) -> str:
-        """Speech-to-text with one retry. Calls are serialized: FLM runs one ASR job at a time anyway,
-        and we have seen rare NPU errors ("qds_device::wait() unexpected command state") that a retry,
-        or reloading Whisper, clears."""
+        """Speech-to-text with one retry, holding the NPU. We have seen rare NPU errors
+        ("qds_device::wait() unexpected command state") that a retry, or reloading Whisper, clears."""
         wav = pcm_to_wav(pcm)
-        async with self._stt_lock:
+        async with self._npu:
             for attempt in (1, 2):
                 try:
                     return await self.lm.transcribe(wav, self.names["stt"], self.cfg.voice.language)

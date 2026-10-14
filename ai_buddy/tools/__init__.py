@@ -1,7 +1,6 @@
-"""Tool plugins for Kira.
+"""Tools Kira can call, and the registry that parses and runs the model's tool calls.
 
-Adding a tool is a single file: put a module in this package (or in the folder named by
-`tools.plugin_dir` in config.toml) that defines a subclass of `Tool`:
+Tools come from skills (see ai_buddy.skills): a skill's tools.py defines subclasses of `Tool`:
 
     from ai_buddy.tools import Tool, ToolResult
 
@@ -15,25 +14,20 @@ Adding a tool is a single file: put a module in this package (or in the folder n
             import random
             return ToolResult({"result": random.choice(["heads", "tails"])}, summary="Flipped a coin")
 
-Modules whose name starts with "_" are helpers, not plugins. List the tool's `name` in
-`tools.enabled` to switch it on.
+A tool that changes something outside the conversation (writes a file, sends a message, runs a program)
+sets `confirm = True`: Kira then asks the user before it runs. A tool can also claim requests whose intent
+is unambiguous by overriding `route()` (see ai_buddy.router).
 """
 
 from __future__ import annotations
 
 import asyncio
-import importlib
-import importlib.util
-import inspect
 import json
 import logging
-import pkgutil
 import random
 import re
-import sys
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from pathlib import Path
 from zoneinfo import ZoneInfo
 from typing import TYPE_CHECKING, Any
 
@@ -82,6 +76,7 @@ class ToolCall:
     raw_arguments: str
     error: str | None = None
     repaired: bool = False
+    routed: bool = False        # made by the app (ai_buddy.router), not chosen by the model
 
     def for_history(self) -> dict:
         """The call as an OpenAI-style assistant `tool_calls` entry (arguments as a JSON string)."""
@@ -99,6 +94,8 @@ class Tool:
     label: str = ""                     # status line while it runs, e.g. "Searching the web"
     filler: str | list[str] = "One moment."   # what Kira says while it runs
     timeout_s: float | None = None      # default: tools.timeout_s
+    confirm: bool = False               # ask the user before running (it changes something outside the chat)
+    skill: str = ""                     # the skill this tool belongs to (set when the skill is loaded)
 
     def schema(self) -> dict:
         return {"type": "function", "function": {
@@ -112,36 +109,19 @@ class Tool:
     def filler_line(self) -> str:
         return random.choice(self.filler) if isinstance(self.filler, list) else self.filler
 
+    def route(self, text: str, ctx: ToolContext) -> dict | None:
+        """Arguments for a call this request unambiguously needs, or None. The app then makes the call
+        itself instead of trusting the model to (see ai_buddy.router). Keep the patterns strict."""
+        return None
+
+    def confirm_text(self, args: dict) -> str:
+        """What Kira says when asking permission, e.g. "Should I save that note to ideas.md?"."""
+        detail = self.describe(args)
+        action = f"go ahead with {self.label[0].lower() + self.label[1:]}" if self.label else f"run {self.name}"
+        return f"Should I {action}{f' ({detail})' if detail else ''}?"
+
     async def run(self, args: dict, ctx: ToolContext) -> ToolResult:
         raise NotImplementedError
-
-
-def _tools_in(module) -> list[type[Tool]]:
-    return [obj for _, obj in inspect.getmembers(module, inspect.isclass)
-            if issubclass(obj, Tool) and obj is not Tool and obj.__module__ == module.__name__ and obj.name]
-
-
-def discover(plugin_dir: str = "") -> list[Tool]:
-    """Instantiate every Tool subclass in this package and in `plugin_dir`."""
-    classes: list[type[Tool]] = []
-    for info in pkgutil.iter_modules(__path__):
-        if not info.name.startswith("_"):
-            classes += _tools_in(importlib.import_module(f"{__name__}.{info.name}"))
-    if plugin_dir:
-        folder = Path(plugin_dir).expanduser()
-        for path in sorted(folder.glob("*.py")) if folder.is_dir() else []:
-            if path.name.startswith("_"):
-                continue
-            mod_name = f"ai_buddy_user_tools.{path.stem}"
-            try:
-                spec = importlib.util.spec_from_file_location(mod_name, path)
-                module = importlib.util.module_from_spec(spec)
-                sys.modules[mod_name] = module
-                spec.loader.exec_module(module)
-                classes += _tools_in(module)
-            except Exception:
-                log.exception("could not load tool plugin %s", path)
-    return [cls() for cls in classes]
 
 
 class ToolRegistry:
@@ -151,11 +131,9 @@ class ToolRegistry:
 
     @classmethod
     def from_config(cls, cfg: Config) -> ToolRegistry:
-        found = {t.name: t for t in discover(cfg.tools.plugin_dir)}
-        missing = [n for n in cfg.tools.enabled if n not in found]
-        if missing:
-            log.warning("enabled tools not found: %s (available: %s)", missing, sorted(found))
-        return cls([found[n] for n in cfg.tools.enabled if n in found], cfg.tools.timeout_s)
+        """The tools of the skills enabled in config.toml (for scripts; the app uses its SkillSet)."""
+        from ..skills import SkillSet
+        return SkillSet.from_config(cfg).registry()
 
     def __bool__(self) -> bool:
         return bool(self.tools)
