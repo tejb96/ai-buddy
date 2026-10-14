@@ -9,7 +9,8 @@ cd scripts/bench
 ```
 
 Synthesized speech (Kokoro) is cached in `audio_cache/`, JSON results go to `results/`; both are git-ignored.
-Keep runs short and spaced out: long back-to-back loops heat the laptop up.
+Keep runs short and spaced out: long back-to-back loops heat the laptop up. Never send Whisper and LLM
+requests at the same time (FLM 1.0.6 corrupts both results).
 
 | Script | What it measures |
 |---|---|
@@ -20,7 +21,10 @@ Keep runs short and spaced out: long back-to-back loops heat the laptop up.
 | `stt_chunking.py <model> [min_s] [pause_s]` | Accuracy cost of cutting speech at pauses, and the leftover tail. |
 | `stt_realtime.py <model> [vad\|manual]` | Lemonade's `/realtime` WebSocket: interim and final transcript timing. |
 | `extract_librispeech.py <parquet> librispeech` | Converts the LibriSpeech sample to PCM + manifest (see below). |
-| `audio_llm.py whisper:<llm>\|audio:<llm> [sections]` | Same spoken test set through Whisper + a text LLM, or straight into an audio-input LLM (Gemma 4): tool choice, multi-turn no-guessing, understanding/reply style, transcription. `REDUCED=1` runs ~20 cases. |
+| `audio_llm.py whisper:<llm>\|audio:<llm>\|heard:<llm> [sections]` | Same spoken test set through Whisper + a text LLM, or straight into an audio-input LLM (Gemma 4): tool choice, multi-turn no-guessing, understanding/reply style, transcription. `heard:` + section `heard`: the model writes a `<heard>` transcript before replying; scored against Whisper on the same clips (`LS_N` LibriSpeech clips). `REDUCED=1` runs ~20 cases. Records temperatures. |
+| `gemma_audio_cache.py [llm]` | Context cost of audio input (tokens per second) and which history format keeps FLM's prompt cache (audio kept vs. replaced by text). |
+| `tool_choice.py [llm]` | Whether FLM honors `tool_choice`, whether it changes the prompt, and the cache after an aborted stream. |
+| `stability.py [llm] [whisper\|heard]` | A 20-turn spoken conversation with the real tools and a sample notes folder (turns 8 s apart), then a practice talk transcribed by Whisper and feedback from the LLM: crashes, evictions (PIDs), prompt-cache misses, drift, tool use, temperatures. Whisper never runs alongside the LLM (two FLM jobs at once corrupt each other). |
 | `llm_bench.py <model> [ctx] [sections]` | Time to first spoken word in a growing conversation, prefill speed, 24 tool-calling prompts, tool result -> spoken answer. |
 | `llm_tune.py <model> <ctx> '<flm_args>'` | First-token latency under FLM launch args (`--pmode turbo`, `--prefill-chunk-len N`). |
 | `llm_cache_greeting.py` | Whether a generated greeting primes FLM's prompt cache for the first user turn. |

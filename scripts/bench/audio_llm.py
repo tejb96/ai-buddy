@@ -3,7 +3,11 @@
 Usage: python audio_llm.py <pipeline> [sections]
   pipeline: "whisper:<llm>"  transcribe with whisper-v3-turbo-FLM, then send the text to <llm>
             "audio:<llm>"    send the recording itself to <llm> (input_audio content part)
-  sections: comma list of tools,multi,understand,transcribe (default: all)
+            "heard:<llm>"    like audio, but the model first writes what it heard in <heard>...</heard>
+                             (one pass: transcript and reply in the same turn)
+  sections: comma list of tools,multi,understand,transcribe (default: all); for heard: heard
+            (tool prompts, filler answers and LS_N LibriSpeech clips, scored against Whisper's
+            transcripts of the same clips from the whisper:qwen3.6-moe-35b-a3b-FLM results)
 
 Uses Kira's real system prompt and tool schemas (ai_buddy.prompts / ai_buddy.tools). Quality only:
 no latency numbers are reported. Calls are spaced out (PAUSE_S, default 1 s) to keep the laptop cool.
@@ -21,10 +25,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # the repo root
 from ai_buddy.config import load_config  # noqa: E402
 from ai_buddy.metrics import count_fillers  # noqa: E402
-from ai_buddy.prompts import chat_system_prompt  # noqa: E402
-from ai_buddy.tools import ToolRegistry  # noqa: E402
+from ai_buddy.prompts import HEARING, chat_system_prompt  # noqa: E402
+from ai_buddy.skills import SkillSet  # noqa: E402
 
-from common import add_noise, dump, http, load, silence, synth, transcribe, wav, wer  # noqa: E402
+from common import ThermalLog, add_noise, dump, http, load, loaded, norm, silence, synth, transcribe, wav, wer  # noqa: E402
 _argv, sys.argv = sys.argv, sys.argv[:1]   # llm_bench reads its own arguments at import
 from llm_bench import TOOL_CASES  # noqa: E402
 sys.argv = _argv
@@ -45,11 +49,13 @@ VOICES = ["am_michael", "af_heart", "bf_emma", "bm_george", "af_bella", "am_adam
 LS = Path(__file__).parent / "librispeech"
 
 CFG = load_config()
-REG = ToolRegistry.from_config(CFG)
-SYSTEM = chat_system_prompt(CFG.persona, "America/Edmonton")
-if KIND == "audio":
-    SYSTEM = SYSTEM.replace("The user's words come from speech recognition and may contain small errors; "
-                            "infer what they meant.", "You hear the user's voice directly.")
+SKILLS = SkillSet.from_config(CFG)
+REG = SKILLS.registry()
+# Kira's real chat prompt (as of this commit; runs before 2026-10-14 used the pre-skills prompt).
+SYSTEM = chat_system_prompt(CFG.persona, "America/Edmonton", SKILLS.chat_instructions(),
+                            {"whisper": "text", "audio": "audio", "heard": "heard"}[KIND])
+HEARD_RULE = HEARING["heard"]
+LS_N = int(os.environ.get("LS_N", "30"))     # LibriSpeech clips in the heard section
 
 
 def spoken(text: str, i: int, noisy: bool = False) -> bytes:
@@ -81,7 +87,50 @@ def complete(messages: list[dict], tools: bool = True, max_tokens: int = 300) ->
     msg = r.json()["choices"][0]["message"]
     calls = [{"id": c.get("id", ""), "name": c["function"].get("name", ""),
               "arguments": c["function"].get("arguments", "")} for c in msg.get("tool_calls") or []]
-    return {"text": msg.get("content") or "", "calls": calls}
+    return {"text": msg.get("content") or "", "calls": calls, "usage": r.json().get("usage", {})}
+
+
+HEARD = re.compile(r"\s*<heard>(.*?)</heard>\s*", re.S)
+
+
+def complete_heard(messages: list[dict], max_tokens: int = 400) -> dict:
+    """Streamed completion (FLM streams one token per chunk), split into the <heard> transcript and the reply.
+    heard_tokens = output tokens up to and including </heard>: the extra cost of the transcript."""
+    body = {"model": LLM, "messages": messages, "stream": True, "think": False, "temperature": CHAT_TEMPERATURE,
+            "max_completion_tokens": max_tokens, "tools": REG.schemas(), "stream_options": {"include_usage": True}}
+    chunks, calls, usage = [], {}, {}
+    with http.stream("POST", "/chat/completions", json=body) as r:
+        if r.status_code != 200:
+            time.sleep(PAUSE_S)
+            return {"error": f"{r.status_code} {r.read()[:300]!r}", "text": "", "heard": "", "heard_ok": False,
+                    "heard_tokens": None, "calls": [], "usage": {}}
+        for line in r.iter_lines():
+            if not line.startswith("data:") or line[5:].strip() == "[DONE]":
+                continue
+            d = json.loads(line[5:])
+            usage = d.get("usage") or usage
+            for ch in d.get("choices", []):
+                delta = ch.get("delta") or {}
+                if delta.get("content"):
+                    chunks.append(delta["content"])
+                for tc in delta.get("tool_calls") or []:
+                    c = calls.setdefault(tc.get("index", len(calls)), {"id": "", "name": "", "arguments": ""})
+                    fn = tc.get("function") or {}
+                    c["id"] = tc.get("id") or c["id"]
+                    c["name"] += fn.get("name") or ""
+                    c["arguments"] += fn.get("arguments") or ""
+    time.sleep(PAUSE_S)
+    text = "".join(chunks)
+    heard_tokens, acc = None, ""
+    for k, piece in enumerate(chunks, 1):
+        acc += piece
+        if "</heard>" in acc:
+            heard_tokens = k
+            break
+    m = HEARD.match(text)
+    return {"text": text[m.end():] if m else text, "heard": " ".join(m.group(1).split()) if m else "",
+            "heard_ok": bool(m), "heard_tokens": heard_tokens, "calls": [calls[i] for i in sorted(calls)],
+            "usage": usage}
 
 
 def spoken_style(text: str) -> list[str]:
@@ -284,16 +333,115 @@ def run_transcribe() -> dict:
             "librispeech_cut_short": truncated, "rows": rows}
 
 
+# ---------- heard: transcript + reply in one pass, against Whisper on the same clips ----------
+
+BASELINE = Path(__file__).parent / "results" / "audio_llm_whisper_qwen3.6-moe-35b-a3b-FLM.json"
+
+
+def _errors(ref: str, hyp: str) -> tuple[int, int]:
+    return wer(ref, hyp) if hyp else (len(norm(ref)), len(norm(ref)))
+
+
+def run_heard() -> dict:
+    base = json.loads(BASELINE.read_text())
+    w_tools = {(r["prompt"], r["noisy"]): r["heard"] for r in base["tools"]["rows"]}
+    w_fill = [r for r in base["transcribe"]["rows"] if r["kind"] == "fillers"]
+    w_ls = [r for r in base["transcribe"]["rows"] if r["kind"] == "librispeech"]
+    rows, diffs = [], []
+
+    def turn(kind: str, ref: str, pcm: bytes, whisper: str, **extra) -> dict:
+        out = complete_heard([{"role": "system", "content": SYSTEM}, user_msg(pcm)[0]])
+        e_g, n = _errors(ref, out["heard"])
+        e_w, _ = _errors(ref, whisper)
+        u = out["usage"]
+        row = {"kind": kind, "ref": ref, "heard": out["heard"], "heard_ok": out["heard_ok"], "whisper": whisper,
+               "err_gemma": e_g, "err_whisper": e_w, "n": n, "heard_tokens": out["heard_tokens"],
+               "completion_tokens": u.get("completion_tokens"), "decode_tps": u.get("decoding_speed_tps"),
+               "reply": out["text"], "calls": out["calls"], "style": spoken_style(out["text"]),
+               "error": out.get("error"), **extra}
+        rows.append(row)
+        if e_g or e_w or not out["heard_ok"]:
+            diffs.append(row)
+        flag = "ok " if out["heard_ok"] else "NO-HEARD"
+        print(f"  {flag} {kind:<6} gemma {e_g}/{n} whisper {e_w}/{n} {out['heard_tokens']} tok | {out['heard'][:70]!r}")
+        return row
+
+    # 1. The 24 tool prompts, clean and noisy: transcript accuracy and tool choice in heard mode.
+    tool_ok = 0
+    for i, (prompt, allowed, argcheck) in enumerate(TOOL_CASES):
+        for noisy in (False, True):
+            row = turn("tools", prompt, spoken(prompt, i + noisy, noisy), w_tools.get((prompt, noisy), ""),
+                       noisy=noisy)
+            names = {p.name for p in (REG.parse(c) for c in row["calls"]) if not p.error}
+            arg_ok = argcheck is None or not argcheck or bool(re.search(
+                argcheck, json.dumps([REG.parse(c).args for c in row["calls"]]).lower()))
+            row["tool_ok"] = names in allowed and arg_ok
+            tool_ok += row["tool_ok"]
+    # 2. Answers full of fillers (same clips as the Whisper transcription rows).
+    kept_g = kept_w = total = 0
+    k = 0
+    for i, text in enumerate(FILLERS):
+        for v in range(2):
+            row = turn("filler", text, spoken(text, i + v), w_fill[k]["hyp"])
+            k += 1
+            fr = count_fillers(text)
+            total += sum(fr.values())
+            kept_g += sum(min(n, fr.get(w, 0)) for w, n in count_fillers(row["heard"]).items())
+            kept_w += sum(min(n, fr.get(w, 0)) for w, n in count_fillers(row["whisper"]).items())
+            row["fillers_ref"] = dict(fr)
+            row["fillers_gemma"] = dict(count_fillers(row["heard"]))
+    # 3. Real speech: the first LS_N LibriSpeech clips.
+    for j, m in enumerate(json.loads((LS / "manifest.json").read_text())[:LS_N]):
+        turn("libri", m["text"], (LS / m["file"]).read_bytes(), w_ls[j]["hyp"])
+
+    def wer_pct(kind: str, who: str, noisy: bool | None = None) -> float:
+        sel = [r for r in rows if r["kind"] == kind and (noisy is None or r.get("noisy") == noisy)]
+        return round(100 * sum(r[f"err_{who}"] for r in sel) / max(1, sum(r["n"] for r in sel)), 1)
+
+    toks = sorted(r["heard_tokens"] for r in rows if r["heard_tokens"])
+    words_heard = sum(len(r["heard"].split()) for r in rows if r["heard_tokens"])
+    tps = sorted(r["decode_tps"] for r in rows if r["decode_tps"])
+    summary = {
+        "turns": len(rows), "heard_present": f"{sum(r['heard_ok'] for r in rows)}/{len(rows)}",
+        "heard_present_on_tool_turns": f"{sum(r['heard_ok'] for r in rows if r['calls'])}/{sum(1 for r in rows if r['calls'])}",
+        "tool_choice_ok": f"{tool_ok}/{sum(1 for r in rows if r['kind'] == 'tools')}",
+        "wer_tools_clean": {"gemma": wer_pct("tools", "gemma", False), "whisper": wer_pct("tools", "whisper", False)},
+        "wer_tools_noisy": {"gemma": wer_pct("tools", "gemma", True), "whisper": wer_pct("tools", "whisper", True)},
+        "wer_fillers": {"gemma": wer_pct("filler", "gemma"), "whisper": wer_pct("filler", "whisper")},
+        "wer_librispeech": {"gemma": wer_pct("libri", "gemma"), "whisper": wer_pct("libri", "whisper"),
+                            "clips": min(LS_N, len(w_ls))},
+        "fillers_kept": {"gemma": f"{kept_g}/{total}", "whisper": f"{kept_w}/{total}"},
+        "heard_tokens_per_turn": {"median": toks[len(toks) // 2] if toks else None,
+                                  "mean": round(sum(toks) / len(toks), 1) if toks else None,
+                                  "max": max(toks, default=None),
+                                  "per_word": round(sum(toks) / max(1, words_heard), 2)},
+        "decode_tps_median": round(tps[len(tps) // 2], 2) if tps else None,
+        "style_breaks": sum(bool(r["style"]) for r in rows),
+    }
+    print("  differences (REF / GEMMA / WHISPER):")
+    for r in diffs:
+        print(f"   [{r['kind']}{' noisy' if r.get('noisy') else ''}] {r['ref']}\n      G: {r['heard']}\n      W: {r['whisper']}")
+    return {**summary, "rows": rows}
+
+
 if __name__ == "__main__":
     load(LLM, ctx_size=CFG.models.llm_ctx_size)
     if KIND == "whisper":
         load(STT)
+    pids = {k: v.get("pid") for k, v in loaded().items()}
     results = {}
-    for section, fn in (("tools", run_tools), ("multi", run_multi), ("understand", run_understand),
-                        ("transcribe", run_transcribe)):
-        if section in SECTIONS:
-            print(f"== {section} ({PIPE})")
-            results[section] = fn()
-            time.sleep(5 * PAUSE_S)
-    dump(f"audio_llm_{PIPE.replace(':', '_')}{'_reduced' if REDUCED else ''}", results)
+    with ThermalLog(10) as thermal:
+        for section, fn in (("tools", run_tools), ("multi", run_multi), ("understand", run_understand),
+                            ("transcribe", run_transcribe), ("heard", run_heard)):
+            if section in SECTIONS:
+                print(f"== {section} ({PIPE})")
+                results[section] = fn()
+                time.sleep(5 * PAUSE_S)
+    results["thermal"] = thermal.summary()
+    after = {k: v.get("pid") for k, v in loaded().items()}
+    results["processes"] = {"before": pids, "after": after}
+    if pids != after:
+        print(f"!! loaded models changed during the run: {pids} -> {after}")
+    dump(f"audio_llm_{PIPE.replace(':', '_')}{'_reduced' if REDUCED else ''}{'_' + os.environ['TAG'] if os.environ.get('TAG') else ''}",
+         results)
     print(json.dumps({s: {k: v for k, v in r.items() if k != "rows"} for s, r in results.items()}, indent=1))
