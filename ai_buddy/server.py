@@ -114,13 +114,17 @@ def create_app(cfg: Config, shutdown: Callable[[], None] | None = None) -> FastA
     settings.on_change(on_setting)
 
     async def warm_start():
+        await models.check_backends()
         while True:
             try:
                 await models.prepare_live()
                 log.info("models ready: %s", models.names)
                 break
             except LemonadeError as e:
-                log.warning("waiting for Lemonade: %s", e)
+                if models.backend_updates:   # already reported once, and the UI offers the update
+                    log.debug("waiting for a Lemonade backend update: %s", e)
+                else:
+                    log.warning("waiting for Lemonade: %s", e)
                 await asyncio.sleep(5)
         # Synthesize the tool filler lines once, so they play instantly.
         for tool in svc.tools.tools.values():
@@ -153,6 +157,14 @@ def create_app(cfg: Config, shutdown: Callable[[], None] | None = None) -> FastA
     app = FastAPI(title="AI Buddy", lifespan=lifespan)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", cfg.app.host])
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
+
+    @app.middleware("http")
+    async def revalidate_static(request: Request, call_next):
+        """The app window's Chrome profile would otherwise keep running an old app.js after an update."""
+        response = await call_next(request)
+        if request.url.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-cache"
+        return response
 
     @app.get("/")
     async def index():
@@ -261,6 +273,16 @@ def create_app(cfg: Config, shutdown: Callable[[], None] | None = None) -> FastA
             await models.refresh()
         except LemonadeError:
             pass
+        return models.snapshot()
+
+    @app.post("/api/backends/update", dependencies=[Depends(same_origin)])
+    async def update_backends():
+        """Install the Lemonade backend updates the UI offered; progress arrives as "models" events."""
+        await models.check_backends()
+        if models.backend_updates and not models.updating:
+            task = asyncio.create_task(models.update_backends())
+            background.append(task)
+            task.add_done_callback(lambda t: t in background and background.remove(t))
         return models.snapshot()
 
     # ---------- settings ----------

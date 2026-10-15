@@ -126,6 +126,17 @@ button { font: inherit; color: inherit; }
 .pill[data-state="error"] { color: var(--critical); }
 .pill[data-state="error"] .dot { background: var(--critical); }
 .pill .state { color: var(--muted); }
+.backend-banner {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap; justify-content: space-between;
+  margin: 12px 20px 0; padding: 10px 14px; border-radius: 12px; font-size: 14px;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent); background: var(--accent-wash);
+}
+.backend-banner[hidden] { display: none; }
+.backend-banner > span:first-child { flex: 1 1 320px; min-width: 0; overflow-wrap: anywhere; }
+.backend-banner[data-kind="busy"] { justify-content: flex-start; }
+.backend-banner[data-kind="busy"] > span:first-child { flex: none; }
+.backend-banner[data-kind="error"] { border-color: color-mix(in srgb, var(--critical) 40%, transparent); background: color-mix(in srgb, var(--critical) 8%, transparent); }
+.backend-banner code { font-size: 12px; }
 .icon-btn {
   display: grid; place-items: center; width: 34px; height: 34px; border-radius: 10px; flex: none;
   border: 1px solid var(--border); background: var(--surface); cursor: pointer; color: var(--ink-2);

@@ -73,3 +73,78 @@ async def test_the_embedding_model_loads_on_the_cpu_with_a_small_context():
     assert lm.loaded["Qwen3-Embedding-0.6B-GGUF"] == {"llamacpp_backend": "cpu", "llamacpp_args": "--threads 4"}
     assert lm.ctx == {cfg.models.llm: 32768, "Qwen3-Embedding-0.6B-GGUF": 8192}
     assert models.device("embed") == "CPU"
+
+
+class OutdatedLemonade(FakeLemonade):
+    """Lemonade after an upgrade: FLM needs updating before its models load (they are then "not found")."""
+
+    def __init__(self):
+        super().__init__()
+        self.flm = "update_required"
+        self.installs: list[tuple[str, str]] = []
+
+    async def backends(self):
+        return {"flm": {"npu": {"state": self.flm, "version": "v1.0.6",
+                                "release_url": "https://github.com/ROCm/FastFlowLM/releases/tag/v1.0.7"}},
+                "kokoro": {"cpu": {"state": "installed", "version": "b21"}},
+                "llamacpp": {"cpu": {"state": "update_required", "version": "b10825"},
+                             "vulkan": {"state": "installable"}}}
+
+    async def install_backend(self, recipe, backend):
+        self.installs.append((recipe, backend))
+        for pct in (10, 60, 100):
+            yield {"percent": pct}
+        if recipe == "flm":
+            self.flm = "installed"
+
+    async def load(self, model, ctx_size=None, **options):
+        if on_npu(model) and self.flm != "installed":
+            raise LemonadeError(f"Loading {model} failed: model_not_found. The FLM backend is not ready")
+        await super().load(model, ctx_size, **options)
+
+
+async def test_a_failed_load_finds_the_backend_update_and_updating_fixes_it():
+    cfg = Config()
+    cfg.models.embed = "Qwen3-Embedding-0.6B-GGUF"
+    lm = OutdatedLemonade()
+    models = ModelManager(lm, cfg)
+    seen: list[dict] = []
+    models.subscribe(lambda snap: seen.append(snap["backends"]["updating"]))
+    with pytest.raises(LemonadeError):
+        await models.ensure("stt", "llm", "tts")
+    needed = models.snapshot()["backends"]["needed"]
+    # FLM for Whisper and the LLM; llama.cpp's CPU backend for note search (vulkan is not ours, so not asked).
+    assert [(u["spec"], u["action"], u["version"], u["latest"]) for u in needed] == [
+        ("flm:npu", "update", "v1.0.6", "v1.0.7"), ("llamacpp:cpu", "update", "b10825", "")]
+    assert needed[0]["roles"] == ["stt", "llm"] and needed[1]["roles"] == ["embed"]
+
+    await models.update_backends()
+    assert lm.installs == [("flm", "npu"), ("llamacpp", "cpu")]
+    assert {"spec": "flm:npu", "label": "FastFlowLM (NPU)", "percent": 60} in seen
+    assert models.updating is None and models.backend_error is None
+    assert [u["spec"] for u in models.backend_updates] == ["llamacpp:cpu"]   # the fake only "fixes" FLM
+    await models.ensure("stt", "llm", "tts")
+    assert {"whisper-v3-turbo-FLM", "kokoro-v1"} <= set(lm.loaded)
+
+
+async def test_a_failed_backend_update_is_reported_and_can_be_retried():
+    class Failing(OutdatedLemonade):
+        async def install_backend(self, recipe, backend):
+            yield {"percent": 5}
+            raise LemonadeError("Installing flm:npu failed: disk full")
+
+    models = ModelManager(Failing(), Config())
+    await models.check_backends()
+    await models.update_backends()
+    snap = models.snapshot()["backends"]
+    assert snap["error"] == "Installing flm:npu failed: disk full" and snap["updating"] is None
+    assert snap["needed"][0]["spec"] == "flm:npu"
+
+
+async def test_backend_check_keeps_quiet_when_lemonade_is_down():
+    class Down(FakeLemonade):
+        async def backends(self):
+            raise LemonadeError("Lemonade server not reachable")
+
+    models = ModelManager(Down(), Config())
+    assert await models.check_backends() == []

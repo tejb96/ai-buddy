@@ -29,6 +29,7 @@ from .lemonade import Lemonade, LemonadeError
 log = logging.getLogger(__name__)
 
 ROLES = ("stt", "llm", "tts")      # what a conversation needs; "embed" (notes) is loaded on demand
+BACKEND_LABELS = {"flm": "FastFlowLM", "llamacpp": "llama.cpp", "whispercpp": "whisper.cpp", "kokoro": "Kokoro"}
 
 
 def on_npu(model: str) -> bool:
@@ -52,13 +53,19 @@ class ModelManager:
         self._lock = asyncio.Lock()
         self._npu = asyncio.Lock()      # one FLM job (Whisper or LLM) at a time
         self._listeners: set[Callable[[dict], None]] = set()
+        # Lemonade backends our models need that must be updated (or installed) before they load, e.g. FLM after
+        # a Lemonade upgrade: its FLM models are then "not found" until `lemonade backends install flm:npu`.
+        self.backend_updates: list[dict] = []
+        self.updating: dict | None = None     # the backend being installed: {"spec", "label", "percent"}
+        self.backend_error: str | None = None
 
     # ---------- status ----------
 
     def snapshot(self) -> dict:
         return {"models": {r: {"name": self.names[r], "state": self.state[r], "device": self.device(r)}
                            for r in self.names},
-                "error": self.error, "warm": self.warm}
+                "error": self.error, "warm": self.warm,
+                "backends": {"needed": self.backend_updates, "updating": self.updating, "error": self.backend_error}}
 
     def subscribe(self, fn: Callable[[dict], None]) -> None:
         self._listeners.add(fn)
@@ -114,6 +121,7 @@ class ModelManager:
                 except LemonadeError as e:
                     self.error = str(e)
                     self._set(role, "error")
+                    await self.check_backends()     # often the reason: a backend Lemonade wants updated
                     raise
                 self.error = None
                 self.state[role] = "ready"
@@ -139,6 +147,75 @@ class ModelManager:
             return "NPU"
         backend = {"stt": self.cfg.models.stt_backend, "embed": self.cfg.models.embed_backend}.get(role, "cpu")
         return "CPU" if backend == "cpu" else "GPU"
+
+    # ---------- Lemonade backends ----------
+
+    def backend_of(self, role: str) -> tuple[str, str]:
+        """The Lemonade recipe and backend a role's model runs on."""
+        if on_npu(self.names[role]):
+            return "flm", "npu"
+        m = self.cfg.models
+        return {"stt": ("whispercpp", m.stt_backend), "embed": ("llamacpp", m.embed_backend)}.get(role, ("kokoro", "cpu"))
+
+    async def check_backends(self) -> list[dict]:
+        """Find the backends our models need that Lemonade says must be updated (or, for a conversation's models,
+        installed) first. Keeps the last answer when Lemonade can't be reached."""
+        try:
+            info = await self.lm.backends()
+        except (LemonadeError, httpx.HTTPError) as e:
+            log.debug("could not read Lemonade's backends: %s", e)
+            return self.backend_updates
+        needed: dict[str, dict] = {}
+        for role in self.names:
+            recipe, backend = self.backend_of(role)
+            b = info.get(recipe, {}).get(backend) or {}
+            state = b.get("state")
+            if state != "update_required" and not (state == "installable" and role in ROLES):
+                continue
+            spec = f"{recipe}:{backend}"
+            if spec not in needed:
+                url = b.get("release_url") or ""
+                needed[spec] = {"spec": spec, "recipe": recipe, "backend": backend,
+                                "label": f"{BACKEND_LABELS.get(recipe, recipe)} ({backend.upper()})",
+                                "action": "update" if state == "update_required" else "install",
+                                "version": b.get("version", "") if state == "update_required" else "",
+                                "latest": url.rsplit("/tag/", 1)[1] if "/tag/" in url else "", "roles": []}
+            needed[spec]["roles"].append(role)
+        updates = list(needed.values())
+        if updates != self.backend_updates:
+            if updates:
+                log.warning("Lemonade backends to update before the models load: %s",
+                            ", ".join(u["spec"] for u in updates))
+            self.backend_updates = updates
+            self._notify()
+        return updates
+
+    async def update_backends(self) -> None:
+        """Install the backends check_backends() found (what `lemonade backends install` does), one at a time,
+        reporting progress to the UI. Model loads wait until it's done."""
+        if self.updating or not self.backend_updates:
+            return
+        self.backend_error = None
+        async with self._lock:
+            try:
+                for u in list(self.backend_updates):
+                    self.updating = {"spec": u["spec"], "label": u["label"], "percent": 0}
+                    self._notify()
+                    log.info("installing Lemonade backend %s", u["spec"])
+                    async for ev in self.lm.install_backend(u["recipe"], u["backend"]):
+                        pct = ev.get("percent")
+                        if isinstance(pct, (int, float)) and int(pct) != self.updating["percent"]:
+                            self.updating = {**self.updating, "percent": int(pct)}   # snapshots may be queued
+                            self._notify()
+                    log.info("installed Lemonade backend %s", u["spec"])
+            except (LemonadeError, httpx.HTTPError) as e:
+                self.backend_error = str(e) or e.__class__.__name__
+                log.warning("backend update failed: %s", self.backend_error)
+            finally:
+                self.updating = None
+                self.error = None
+        await self.check_backends()
+        self._notify()
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         """Embeddings for note search (loads the embedding model on the CPU first if needed)."""

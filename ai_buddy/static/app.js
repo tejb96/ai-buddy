@@ -275,8 +275,11 @@ function onEvent(ev) {
     case "models":
       state.models = ev.models;
       state.warm = ev.warm;
+      state.backends = ev.backends || null;
       renderModels();
-      if (ev.error && ev.error !== state.lastModelError) toast(ev.error, "error", 8000);
+      renderBackends();
+      // A missing backend update makes every load fail with a long error: the banner explains it instead.
+      if (ev.error && ev.error !== state.lastModelError && !state.backends?.needed?.length) toast(ev.error, "error", 8000);
       state.lastModelError = ev.error;
       break;
     case "session":
@@ -871,6 +874,39 @@ function renderModels() {
   }));
 }
 
+// Lemonade wants a backend (usually FastFlowLM, after a Lemonade upgrade) updated before our models will load.
+function renderBackends() {
+  const box = $("backend-banner");
+  const b = state.backends;
+  if (!b || (!b.needed.length && !b.updating && !b.error)) { box.hidden = true; box.replaceChildren(); return; }
+  box.hidden = false;
+  if (b.updating) {
+    box.dataset.kind = "busy";
+    box.replaceChildren(el("span", { class: "spinner" }),
+      el("span", {}, `Updating ${b.updating.label} in Lemonade… ${b.updating.percent ? b.updating.percent + "%" : ""}`));
+    return;
+  }
+  if (!b.needed.length) {               // the update failed but Lemonade no longer asks for it
+    box.dataset.kind = "error";
+    box.replaceChildren(el("span", {}, `Backend update: ${b.error}`));
+    return;
+  }
+  box.dataset.kind = b.error ? "error" : "warn";
+  const what = b.needed.map((u) => u.action === "update" && u.version && u.latest
+    ? `${u.label} ${u.version} → ${u.latest}` : `${u.label}${u.action === "install" ? " (not installed)" : ""}`).join(", ");
+  const btn = el("button", { class: "btn primary", type: "button" }, b.error ? "Try again" : b.needed.some((u) => u.action === "update") ? "Update now" : "Install now");
+  btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    try { await api("/api/backends/update", { method: "POST" }); }
+    catch (e) { btn.disabled = false; toast(`Couldn't start the update: ${e.message}`, "error"); }
+  });
+  box.replaceChildren(
+    el("span", {}, el("strong", {}, "Lemonade needs a backend update before the models can load: "), what,
+      b.error ? el("span", { class: "small" }, ` · Last try failed: ${b.error}`) : null,
+      el("span", { class: "muted small" }, ` · Same as ${b.needed.map((u) => `\`lemonade backends install ${u.spec}\``).join(" and ")}`)),
+    btn);
+}
+
 function statusText() {
   if (!state.connected) return "Connecting to AI Buddy…";
   if (state.recording) return state.mode === "presentation" ? "Recording your talk. Press Stop when you're done." : "Listening…";
@@ -880,6 +916,8 @@ function statusText() {
   if (state.server === "confirm") return "Waiting for your answer: say yes or no, or use the buttons.";
   if (state.server === "loading" || state.server === "analyzing") return state.detail || "Working…";
   if (state.playing) return `${counterpart()} is talking. Press Space to interrupt.`;
+  if (!state.warm && state.backends?.updating) return "Updating Lemonade's backend…";
+  if (!state.warm && state.backends?.needed?.length) return "Waiting for the Lemonade backend update (see the banner above).";
   if (!state.warm) return "Warming up the models…";
   if (state.mode === "presentation") return state.pres.phase === "results" ? "Ready for another take." : "Ready when you are.";
   return state.handsFree ? "Hands-free: just start talking." : "Hold Space or the button to talk.";

@@ -44,6 +44,47 @@ class Lemonade:
         r.raise_for_status()
         return {m["id"]: m for m in r.json().get("data", [])}
 
+    async def backends(self) -> dict[str, dict[str, dict]]:
+        """Lemonade's inference backends by recipe and backend, e.g. ["flm"]["npu"] = {"state": "update_required",
+        "version": "v1.0.6", "release_url": ...}. States include installed, update_required and installable."""
+        try:
+            r = await self._http.get("/system-info", timeout=10)
+        except httpx.HTTPError as e:
+            raise LemonadeError(f"Lemonade server not reachable at {self.base_url} ({e.__class__.__name__})") from e
+        if r.status_code != 200:
+            raise LemonadeError(f"Reading Lemonade's backends failed ({r.status_code}): {r.text[:300]}")
+        return {recipe: info.get("backends", {}) for recipe, info in r.json().get("recipes", {}).items()}
+
+    async def install_backend(self, recipe: str, backend: str) -> AsyncIterator[dict]:
+        """Install or update a backend (what `lemonade backends install recipe:backend` does), yielding Lemonade's
+        download progress events ({"percent", "file", "bytes_downloaded", ...}) until it completes."""
+        body = {"recipe": recipe, "backend": backend, "stream": True}
+        event = ""
+        async with self._http.stream("POST", "/install", json=body,
+                                     timeout=httpx.Timeout(10.0, read=600)) as r:
+            if r.status_code != 200:
+                raise LemonadeError(f"Installing {recipe}:{backend} failed ({r.status_code}): "
+                                    f"{(await r.aread())[:300]!r}")
+            async for line in r.aiter_lines():
+                if line.startswith("event:"):
+                    event = line[6:].strip()
+                    continue
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                try:
+                    payload = json.loads(data) if data else {}
+                except json.JSONDecodeError:
+                    payload = {"message": data}
+                if event == "complete":
+                    return
+                if event == "error" or (isinstance(payload, dict) and "error" in payload):
+                    err = payload.get("error", data) if isinstance(payload, dict) else data
+                    raise LemonadeError(f"Installing {recipe}:{backend} failed: {err}")
+                if isinstance(payload, dict):
+                    yield payload
+        raise LemonadeError(f"Installing {recipe}:{backend} ended without completing")
+
     async def load(self, model: str, ctx_size: int | None = None, **options) -> None:
         """Load a model; `options` are Lemonade recipe options for this load only (e.g. llamacpp_backend)."""
         body: dict = {"model_name": model, **options}
