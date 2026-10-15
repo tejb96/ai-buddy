@@ -147,9 +147,14 @@ class Client:
         deadline = time.monotonic() + timeout
         while True:
             remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(f"timed out; last events: {[e.get('type') for e in self.events[-8:]]}")
-            msg = await asyncio.wait_for(self.ws.recv(), remaining)
+            try:
+                if remaining <= 0:
+                    raise TimeoutError
+                msg = await asyncio.wait_for(self.ws.recv(), remaining)
+            except TimeoutError:
+                said = [e["text"] for e in self.events if e["type"] in ("user_text", "reply_end")][-4:]
+                raise TimeoutError(f"timed out; last events: {[e.get('type') for e in self.events[-8:]]}; "
+                                   f"last words: {said}") from None
             if isinstance(msg, bytes):
                 rid = int.from_bytes(msg[:4], "little")
                 self.audio[rid] = self.audio.get(rid, 0) + len(msg) - 4

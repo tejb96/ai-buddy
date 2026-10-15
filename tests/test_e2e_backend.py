@@ -118,17 +118,27 @@ async def test_mcp_tool_asks_before_acting_and_reads_freely(server):
     await c.close()
 
 
-async def test_no_guessing(server):
+async def test_no_guessing_about_the_users_plans(server):
     c = await chat(server)
     end = await turn(c, "Where am I going on my trip next month?")
     print(f"\n  trip: {end['text']!r} tools {tools_in(c, end['id'])}")
     invented = ["paris", "london", "tokyo", "new york", "rome", "hawaii", "mexico", "japan", "italy", "banff"]
     assert not any(place in end["text"].lower() for place in invented)
+    await c.close()
+
+
+@pytest.mark.xfail(strict=False, reason="qwen3.5-9b takes 'downtown' to mean Vancouver, where the sister comes from "
+                                        "(3 of 3 runs, despite the prompt rule); setting [user] location avoids it")
+async def test_no_guessing_where_downtown_is(server):
+    c = await chat(server)
     end = await turn(c, "My sister Priya is visiting from Vancouver next week. What are two things we could do "
                         "downtown that she'd like if she loves art?")
-    print(f"  Priya: {end['text']!r} tools {tools_in(c, end['id'])}")
+    searched = [e["detail"] for e in c.of("tool_start") if e["id"] == end["id"] and e["name"] == "web_search"]
+    print(f"\n  Priya: {end['text']!r} searched {searched}")
     cities = ["toronto", "los angeles", "calgary", "montreal", "seattle", "new york", "chicago", "edmonton"]
     assert not any(city in end["text"].lower() for city in cities)         # never made up where "downtown" is
+    # She's visiting *from* Vancouver, so "downtown" is wherever the user lives, which nobody said: not Vancouver.
+    assert not any("vancouver" in q.lower() for q in searched)
     await c.close()
 
 

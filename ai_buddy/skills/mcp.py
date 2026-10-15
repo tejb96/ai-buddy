@@ -312,7 +312,9 @@ class McpServer:
                          f"mean this folder; use full paths inside it." if self.needs_folder else "")
                 self.skill.instructions = (f"- {self.name} ({self.skill.description.rstrip('.')}): its tools are "
                                            f"{names}. Use them when the user asks for that; tools that change "
-                                           f"something ask the user first, so just call them.{where}")
+                                           f"something ask the user first, so just call them. What it holds can "
+                                           f"change outside this chat, so look it up again instead of answering from "
+                                           f"memory.{where}")
                 self.skill.status = "ready"
                 self._ready.set()
                 await self._stop.wait()
