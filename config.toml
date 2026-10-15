@@ -68,14 +68,44 @@ enabled = ["web-search", "notes", "clock", "calculator", "speaking-coach"]
 dirs = []                     # folders with your own skills
 confirm_timeout_s = 60        # skills that change things ask first; no answer within this = no
 
-# MCP servers become skills too (add the name to skills.enabled, or switch it on in the app). Kira asks before
-# every tool call unless the server marks the tool read-only or it's listed in auto_approve. Example:
-# [mcp.servers.files]
-# command = "npx"
-# args = ["-y", "@modelcontextprotocol/server-filesystem", "/home/me/Documents/kira-files"]
-# description = "Read and write files in ~/Documents/kira-files"
-# auto_approve = ["read_file", "list_directory"]
-# (or url = "http://127.0.0.1:8000/mcp" for a server that's already running)
+# MCP servers become skills too: switch them on in the app (gear icon, "MCP servers"), or add the name to
+# skills.enabled. A tool asks you before it runs unless the server marks it read-only, or it's in auto_approve.
+# In command, args, env and headers: {folder} = a folder you pick in the app, {timezone} = your time zone,
+# ${NAME} = a secret from ~/.local/share/ai-buddy/secrets.env (NAME=value lines; keep tokens out of this file).
+# `tools` limits which of a server's tools the model sees (each one costs prompt space). To add a server, copy
+# one of these, then press "Reload servers" in the app. url = "http://..." connects to a running server instead.
+# The three below are the official reference servers (versions pinned; npx and uvx fetch them on first use).
+
+[mcp.servers.files]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem@1.0.0", "{folder}"]
+description = "Reads and writes files in a folder you choose, and asks before changing anything"
+tools = ["read_text_file", "list_directory", "search_files", "get_file_info", "write_file", "edit_file",
+         "create_directory", "move_file"]
+
+[mcp.servers.fetch]
+command = "uvx"
+args = ["mcp-server-fetch==2026.10.10"]
+description = "Reads a web page you name and turns it into text"
+
+[mcp.servers.time]
+command = "uvx"
+args = ["mcp-server-time==2026.10.10", "--local-timezone", "{timezone}"]
+description = "Tells the time in any time zone and converts times between zones"
+
+# GitHub (repositories, issues, pull requests; read-only here). Needs a personal access token: put
+# GITHUB_TOKEN=github_pat_... in ~/.local/share/ai-buddy/secrets.env, then uncomment ONE of these. See the
+# README ("GitHub") for the token's permissions and the binary's download.
+# [mcp.servers.github]
+# command = "github-mcp-server"           # the release binary, unpacked into ~/.local/bin
+# args = ["stdio"]
+# env = { GITHUB_PERSONAL_ACCESS_TOKEN = "${GITHUB_TOKEN}", GITHUB_TOOLSETS = "repos,issues,pull_requests", GITHUB_READ_ONLY = "1" }
+# description = "Your GitHub repositories, issues and pull requests"
+#
+# [mcp.servers.github]                    # or GitHub's hosted server, nothing to install
+# url = "https://api.githubcopilot.com/mcp/readonly"
+# headers = { Authorization = "Bearer ${GITHUB_TOKEN}" }
+# description = "Your GitHub repositories, issues and pull requests"
 
 [tools]
 max_calls_per_turn = 3

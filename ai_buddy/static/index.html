@@ -155,6 +155,24 @@
         <ul class="skills" id="set-skills"></ul>
       </section>
       <section class="set">
+        <h2>MCP servers</h2>
+        <p class="muted small">Skills from <a href="https://modelcontextprotocol.io" target="_blank" rel="noopener noreferrer">MCP servers</a>. Switching one on connects it; its tools that change something ask you first.</p>
+        <ul class="skills" id="set-mcp"></ul>
+        <details class="add-server">
+          <summary>Add a server</summary>
+          <p class="muted small">Add an entry like this to config.toml (a command that starts the server, or <code>url = "…"</code> for one that's already running), then reload. Keep tokens out of config.toml: put <code>NAME=value</code> in <code>~/.local/share/ai-buddy/secrets.env</code> and write <code>${NAME}</code>.</p>
+          <pre class="snippet">[mcp.servers.weather]
+command = "npx"
+args = ["-y", "some-weather-mcp-server@1.0.0"]
+description = "Forecasts from the weather service"</pre>
+          <div class="row">
+            <button class="btn" type="button" id="open-config">Open config.toml</button>
+            <button class="btn" type="button" id="reload-mcp">Reload servers</button>
+            <span class="muted small" id="reload-status" aria-live="polite"></span>
+          </div>
+        </details>
+      </section>
+      <section class="set">
         <h2>Knowledge folder</h2>
         <p class="muted small">Notes, talking points, resumes and READMEs (Markdown, text, PDF, Word, HTML). <span class="persona-name">Bella</span> searches them when you ask and uses them in practice sessions. Changes are picked up automatically.</p>
         <div class="row folder-row">

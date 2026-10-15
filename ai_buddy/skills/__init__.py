@@ -102,6 +102,7 @@ class Skill:
     modules: dict[str, ModuleType] = field(default_factory=dict)
     status: str = "ready"                               # ready | starting | error (MCP servers)
     error: str | None = None
+    extra: dict = field(default_factory=dict)           # more for the settings panel (an MCP server's folder...)
 
     @property
     def modes(self) -> list[str]:
@@ -115,7 +116,7 @@ class Skill:
     def view(self, enabled: bool) -> dict:
         return {"name": self.name, "label": self.label, "description": self.description, "enabled": enabled,
                 "source": self.source, "status": self.status, "error": self.error, "modes": self.modes,
-                "tools": [{"name": t.name, "confirm": t.confirm} for t in self.tools]}
+                "tools": [{"name": t.name, "confirm": t.confirm} for t in self.tools], **self.extra}
 
 
 def _import(path: Path, skill_name: str) -> ModuleType:

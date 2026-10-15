@@ -2,20 +2,34 @@
 
 Each `[mcp.servers.<name>]` entry in config.toml is a skill named <name>. While the skill is on, the app keeps
 a connection to the server (a local process over stdio, or a URL over Streamable HTTP) and offers its tools to
-the model as `<name>_<tool>`. A tool asks the user before it runs unless the server marks it read-only
-(`readOnlyHint`) or it's listed in the server's `auto_approve`.
+the model as `<name>_<tool>` (all of them, or those listed in `tools`). A tool asks the user before it runs
+unless the server marks it read-only (`readOnlyHint`) or it's listed in the server's `auto_approve`.
+
+In a server's command, args, env and headers:
+- `{folder}` is a folder the user picks in Settings (the server doesn't start until one is chosen);
+- `{timezone}` is the local time zone;
+- `${NAME}` is a secret from <data_dir>/secrets.env (NAME=value lines, kept out of config.toml), or else from
+  the environment.
+Local servers' own messages go to <data_dir>/logs/mcp-<name>.log. `npx`, `uvx` and the like are also found in
+the usual per-user places (nvm, ~/.local/bin), since an app started from the desktop doesn't get the shell's PATH.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import re
+import shutil
+from pathlib import Path
 
 from mcp import Client, StdioServerParameters
 from mcp import types as mt
+from mcp.client.stdio import get_default_environment, stdio_client
+from mcp.client.streamable_http import streamable_http_client
+from mcp.shared._httpx_utils import create_mcp_http_client
 
 from ..config import Config, McpServerCfg
 from ..tools import Tool, ToolContext, ToolResult
@@ -24,6 +38,55 @@ from . import Skill, SkillSet
 log = logging.getLogger(__name__)
 
 MAX_TEXT = 6000
+MAX_DESCRIPTION = 320           # characters of a tool's description the model reads (every request carries them)
+USER_BIN_DIRS = ("~/.local/bin", "~/.volta/bin", "~/.cargo/bin", "/usr/local/bin")
+_VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+class McpConfigError(ValueError):
+    pass
+
+
+def find_command(command: str) -> str | None:
+    """The program to run: on PATH, or in nvm's newest Node or another per-user bin folder."""
+    if os.sep in command:
+        path = Path(command).expanduser()
+        return str(path) if os.access(path, os.X_OK) else None
+    if found := shutil.which(command):
+        return found
+
+    def version(p: Path) -> tuple:
+        return tuple(int(x) if x.isdigit() else 0 for x in p.parent.name.lstrip("v").split("."))
+    nvm = sorted(Path("~/.nvm/versions/node").expanduser().glob("*/bin"), key=version, reverse=True)
+    for folder in [*nvm, *(Path(d).expanduser() for d in USER_BIN_DIRS)]:
+        if os.access(folder / command, os.X_OK) and (folder / command).is_file():
+            return str(folder / command)
+    return None
+
+
+def read_secrets(path: Path) -> dict[str, str]:
+    """NAME=value lines (blank lines and # comments ignored; values may be quoted)."""
+    out = {}
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, _, value = line.removeprefix("export ").partition("=")
+            out[key.strip()] = value.strip().strip("'\"")
+    return out
+
+
+def short_description(text: str, limit: int = MAX_DESCRIPTION) -> str:
+    """A tool's description cut to whole sentences within `limit` characters."""
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    end = max(cut.rfind(". "), cut.rfind("; "))
+    return cut[:end + 1] if end > limit // 3 else cut.rstrip() + "…"
 
 
 def skill_name(server: str) -> str:
@@ -57,7 +120,7 @@ class McpTool(Tool):
     def __init__(self, server: McpServer, spec: mt.Tool):
         self.server, self.remote = server, spec.name
         self.name = tool_name(server.name, spec.name)
-        self.description = (spec.description or spec.title or spec.name).strip()[:1000]
+        self.description = short_description(spec.description or spec.title or spec.name)
         self.input_schema = dict(spec.input_schema or {"type": "object", "properties": {}})
         self.parameters = self.input_schema.get("properties") or {}
         self.required = list(self.input_schema.get("required") or [])
@@ -95,25 +158,78 @@ class McpServer:
     """One configured server: a long-lived connection in its own task (the SDK's context managers must be
     entered and left in the same task)."""
 
-    def __init__(self, name: str, cfg: McpServerCfg):
+    def __init__(self, name: str, cfg: McpServerCfg, *, folder: str = "", timezone: str = "UTC",
+                 data_dir: Path | None = None):
         self.name, self.cfg = name, cfg
+        self.folder, self.timezone, self.data_dir = folder, timezone, data_dir
         self.client: Client | None = None
         self.skill = Skill(name, cfg.description or f"Tools from the MCP server '{name}'.", source="mcp",
                            status="off")
+        self.skill.extra = self.details()
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._ready = asyncio.Event()
 
-    def _target(self):
-        if self.cfg.url:
-            return self.cfg.url
-        env = {**os.environ, **self.cfg.env} if self.cfg.env else None
-        return StdioServerParameters(command=self.cfg.command, args=[os.path.expanduser(a) for a in self.cfg.args],
-                                     env=env)
+    @property
+    def needs_folder(self) -> bool:
+        c = self.cfg
+        return any("{folder}" in v for v in [c.command, c.url, *c.args, *c.env.values(), *c.headers.values()])
 
-    async def start(self, timeout_s: float = 30) -> None:
+    @property
+    def secrets_path(self) -> Path | None:
+        return self.data_dir / "secrets.env" if self.data_dir else None
+
+    @property
+    def log_path(self) -> Path | None:
+        return self.data_dir / "logs" / f"mcp-{self.name}.log" if self.data_dir and not self.cfg.url else None
+
+    def details(self) -> dict:
+        """What Settings shows besides the switch."""
+        return {"needs_folder": self.needs_folder, "folder": self.folder, "kind": "url" if self.cfg.url else "command",
+                "target": self.cfg.url or " ".join([self.cfg.command, *self.cfg.args]),
+                "log": str(self.log_path) if self.log_path else None}
+
+    def _fill(self, text: str, secrets: dict[str, str]) -> str:
+        text = text.replace("{folder}", self.folder).replace("{timezone}", self.timezone)
+
+        def var(m: re.Match) -> str:
+            if m[1] in secrets:
+                return secrets[m[1]]
+            if m[1] in os.environ:
+                return os.environ[m[1]]
+            raise McpConfigError(f"${{{m[1]}}} isn't set: add {m[1]}=... to {self.secrets_path or 'secrets.env'}")
+        return _VAR.sub(var, text)
+
+    async def _transport(self, stack: contextlib.AsyncExitStack):
+        """The SDK transport for this server (entered by the Client), with placeholders and secrets filled in."""
+        if self.needs_folder and not self.folder:
+            raise McpConfigError("choose its folder first")
+        secrets = read_secrets(self.secrets_path) if self.secrets_path else {}
+        if self.cfg.url:
+            url = self._fill(self.cfg.url, secrets)
+            if not self.cfg.headers:
+                return streamable_http_client(url)
+            headers = {k: self._fill(v, secrets) for k, v in self.cfg.headers.items()}
+            http = await stack.enter_async_context(create_mcp_http_client(headers=headers))
+            return streamable_http_client(url, http_client=http)
+        command = find_command(self._fill(self.cfg.command, secrets))
+        if not command:
+            raise McpConfigError(f"'{self.cfg.command}' isn't installed (not found on PATH, in nvm or ~/.local/bin)")
+        env = get_default_environment()
+        env.update({k: self._fill(v, secrets) for k, v in self.cfg.env.items()})
+        env["PATH"] = os.pathsep.join([str(Path(command).parent), env.get("PATH", "")])    # npx needs its node
+        args = [os.path.expanduser(self._fill(a, secrets)) for a in self.cfg.args]
+        errlog = None
+        if self.log_path:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            errlog = stack.enter_context(self.log_path.open("a", buffering=1))
+        params = StdioServerParameters(command=command, args=args, env=env)
+        return stdio_client(params, errlog=errlog) if errlog else stdio_client(params)
+
+    async def start(self, timeout_s: float = 60) -> None:
         if self._task and not self._task.done():
             return
+        self.skill.extra = self.details()
         if not (self.cfg.url or self.cfg.command):
             self._fail("set either command or url in config.toml")
             return
@@ -129,22 +245,29 @@ class McpServer:
 
     async def _run(self) -> None:
         try:
-            async with Client(self._target(), read_timeout_seconds=self.cfg.timeout_s) as client:
+            async with contextlib.AsyncExitStack() as stack:
+                target = await self._transport(stack)
+                client = await stack.enter_async_context(Client(target, read_timeout_seconds=self.cfg.timeout_s))
                 self.client = client
                 specs = (await client.list_tools()).tools
+                if self.cfg.tools:
+                    specs = [s for s in specs if s.name in self.cfg.tools]
                 self.skill.tools = [McpTool(self, s) for s in specs]
                 about = self.cfg.description or (client.instructions or "").strip().split("\n")[0][:300]
                 if about:
                     self.skill.description = about
                 names = ", ".join(t.name for t in self.skill.tools)
+                where = f" Its folder is {self.folder}: use full paths inside it." if self.needs_folder else ""
                 self.skill.instructions = (f"- {self.name} ({self.skill.description.rstrip('.')}): its tools are "
                                            f"{names}. Use them when the user asks for that; tools that change "
-                                           "something ask the user first, so just call them.")
+                                           f"something ask the user first, so just call them.{where}")
                 self.skill.status = "ready"
                 self._ready.set()
                 await self._stop.wait()
         except asyncio.CancelledError:
             raise
+        except McpConfigError as e:
+            self._fail(str(e))
         except BaseException as e:   # the SDK raises exception groups from its task group
             self._fail(_describe(e))
             log.warning("MCP server %s stopped: %s", self.name, self.skill.error)
@@ -185,29 +308,80 @@ def _describe(e: BaseException) -> str:
 
 
 class McpManager:
-    """Starts and stops the configured servers as their skills are switched on and off."""
+    """Starts and stops the configured servers as their skills are switched on and off, follows folder choices
+    and re-reads the server list from config.toml on request."""
 
-    def __init__(self, cfg: Config, skills: SkillSet):
-        self.skills = skills
-        self.servers = {skill_name(n): McpServer(skill_name(n), c) for n, c in cfg.mcp.servers.items()}
-        for server in self.servers.values():
-            skills.skills.setdefault(server.name, server.skill)
+    def __init__(self, cfg: Config, skills: SkillSet, *, folders: dict[str, str] | None = None,
+                 timezone: str = "UTC"):
+        self.cfg, self.skills, self.timezone = cfg, skills, timezone
+        self.folders = dict(folders or {})
+        self.servers: dict[str, McpServer] = {}
+        for name, scfg in cfg.mcp.servers.items():
+            self._add(skill_name(name), scfg)
         self._lock = asyncio.Lock()
+
+    def _add(self, name: str, scfg: McpServerCfg) -> McpServer | None:
+        if name in self.skills.skills and self.skills.skills[name].source != "mcp":
+            log.warning("MCP server %r skipped: a built-in skill has that name", name)
+            return None
+        server = McpServer(name, scfg, folder=self.folders.get(name, ""), timezone=self.timezone,
+                           data_dir=self.cfg.app.data_path)
+        self.servers[name] = server
+        self.skills.skills[name] = server.skill
+        return server
 
     async def sync(self) -> None:
         """Connect the servers that are switched on, disconnect the others."""
         async with self._lock:
-            changed = False
-            for name, server in self.servers.items():
-                running = server.skill.status in ("ready", "starting")
-                if self.skills.wanted(name) and not running:
-                    await server.start()
-                    changed = True
-                elif not self.skills.wanted(name) and running:
-                    await server.stop()
-                    changed = True
-            if changed:
-                self.skills.changed()
+            await self._sync()
+
+    async def _sync(self) -> None:
+        changed = False
+        for name, server in self.servers.items():
+            running = server.skill.status in ("ready", "starting")
+            if self.skills.wanted(name) and not running:
+                await server.start()
+                changed = True
+            elif not self.skills.wanted(name) and running:
+                await server.stop()
+                changed = True
+        if changed:
+            self.skills.changed()
+
+    async def set_folder(self, name: str, folder: str) -> None:
+        """A new folder for a server that uses {folder}: reconnect it if it's on."""
+        async with self._lock:
+            self.folders[name] = folder
+            server = self.servers.get(name)
+            if not server:
+                return
+            server.folder = folder
+            server.skill.extra = server.details()
+            if server.skill.status in ("ready", "starting", "error"):
+                await server.stop()
+            await self._sync()
+            self.skills.changed()
+
+    async def reload(self, servers: dict[str, McpServerCfg]) -> dict[str, list[str]]:
+        """Apply a new [mcp.servers] list: add new servers, drop removed ones, restart changed ones."""
+        wanted = {skill_name(n): c for n, c in servers.items()}
+        out: dict[str, list[str]] = {"added": [], "removed": [], "changed": []}
+        async with self._lock:
+            for name in [n for n in self.servers if n not in wanted]:
+                await self.servers.pop(name).stop()
+                self.skills.skills.pop(name, None)
+                out["removed"].append(name)
+            for name, scfg in wanted.items():
+                old = self.servers.get(name)
+                if old and old.cfg == scfg:
+                    continue
+                if old:
+                    await old.stop()
+                if self._add(name, scfg):
+                    out["changed" if old else "added"].append(name)
+            await self._sync()
+        self.skills.changed()
+        return out
 
     async def close(self) -> None:
         for server in self.servers.values():

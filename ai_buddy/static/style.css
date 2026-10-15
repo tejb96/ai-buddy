@@ -404,3 +404,18 @@ dialog.settings { width: min(640px, calc(100vw - 32px)); }
   background: color-mix(in srgb, var(--page) 92%, transparent); backdrop-filter: blur(4px); }
 .stopped[hidden] { display: none; }
 .stopped .card { max-width: 440px; text-align: center; }
+
+/* ---------- MCP servers (settings) ---------- */
+.badge { font-size: 11px; font-weight: 600; padding: 1px 7px; border-radius: 999px; background: var(--surface-3);
+  color: var(--ink-2); white-space: nowrap; }
+.badge[data-kind="ok"] { background: color-mix(in srgb, var(--good) 14%, transparent); color: var(--good); }
+.badge[data-kind="busy"] { background: var(--accent-wash); color: var(--accent-strong); }
+.badge[data-kind="error"] { background: color-mix(in srgb, var(--critical) 14%, transparent); color: var(--critical); }
+.mcp-folder { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 4px; }
+.mcp-folder code { overflow-wrap: anywhere; }
+.skill-error { color: var(--critical); margin-top: 2px; overflow-wrap: anywhere; }
+.add-server { margin-top: 12px; }
+.add-server summary { cursor: pointer; font-weight: 550; color: var(--ink-2); }
+.snippet { background: var(--surface-2); border-radius: 8px; padding: 10px 12px; font-size: 12.5px; overflow-x: auto;
+  margin: 6px 0 10px; }
+.btn.small { padding: 3px 10px; font-size: 13px; }

@@ -918,7 +918,8 @@ function setToggleLabel(btn, text) {
 
 // Practice tabs come from the speaking-coach skill; the empty chat says what the enabled skills can do.
 const SKILL_PHRASES = { "web-search": "look things up online", notes: "check your notes", calculator: "do the math",
-  clock: "tell the time", "speaking-coach": "coach you through a talk or an interview" };
+  clock: "tell the time", "speaking-coach": "coach you through a talk or an interview",
+  files: "work with the files in your folder", fetch: "read web pages", time: "check the time anywhere" };
 
 function applySkills() {
   const modes = new Set(state.config.modes || ["chat"]);
@@ -965,6 +966,14 @@ const LLM_NOTES = {
   "gemma4-it-12b-FLM": "Reads Whisper's transcript too; reliable with tools, a little slower to answer.",
   "qwen3.6-moe-35b-a3b-FLM": "Accurate, but needs much more memory (22 GB) and takes longer to start answering.",
 };
+function mcpStatus(s) {
+  if (!s.enabled) return ["off", "Off"];
+  if (s.status === "ready") return ["ok", `Connected · ${s.tools.length} tool${s.tools.length === 1 ? "" : "s"}`];
+  if (s.status === "starting") return ["busy", "Connecting…"];
+  if (s.status === "error") return ["error", "Error"];
+  return ["off", "Not connected"];
+}
+
 const STT_NOTES = {
   "whisper-v3-turbo-FLM": "Whisper Large v3 Turbo on the NPU (FastFlowLM): the default, light on power.",
   "Whisper-Large-v3-Turbo": "The same Whisper model on whisper.cpp, running on the CPU instead of the NPU. " +
@@ -1011,33 +1020,94 @@ const settingsUI = {
     this.renderIndex(d.knowledge);
   },
   renderSkills(skills) {
-    const status = (s) => s.status === "error" ? `Couldn't connect: ${s.error}` :
-      s.status === "starting" ? "Connecting…" : s.source === "mcp" && s.enabled && s.status === "off" ? "Not connected" : "";
-    $("set-skills").replaceChildren(...skills.map((s) => {
-      const asks = s.tools.filter((t) => t.confirm).length;
+    const toggle = (s) => {
       const input = el("input", { type: "checkbox", checked: s.enabled, "aria-label": `${s.label} on or off` });
-      input.addEventListener("change", () => this.toggleSkill(s.name, input.checked, input));
-      return el("li", { class: "skill", "data-status": s.status },
-        el("label", { class: "switch" }, input, el("span", { class: "slider", "aria-hidden": "true" })),
+      input.addEventListener("change", () => this.toggleSkill(s, input.checked, input));
+      return el("label", { class: "switch" }, input, el("span", { class: "slider", "aria-hidden": "true" }));
+    };
+    const asks = (s) => s.tools.some((t) => t.confirm)
+      ? el("span", { class: "tag asks", title: "Asks you before it changes anything" }, "asks first") : null;
+    $("set-skills").replaceChildren(...skills.filter((s) => s.source !== "mcp").map((s) =>
+      el("li", { class: "skill", "data-status": s.status }, toggle(s),
         el("div", { class: "skill-body" },
-          el("div", { class: "skill-name" }, s.label,
-            s.source !== "built-in" ? el("span", { class: "tag" }, s.source === "mcp" ? "MCP" : "yours") : null,
-            asks ? el("span", { class: "tag asks", title: "Asks you before it changes anything" }, "asks first") : null),
-          el("div", { class: "muted small" }, s.description),
-          status(s) ? el("div", { class: "small skill-status" }, status(s)) : null));
-    }));
+          el("div", { class: "skill-name" }, s.label, s.source === "user" ? el("span", { class: "tag" }, "yours") : null,
+            asks(s)),
+          el("div", { class: "muted small" }, s.description)))));
+    const servers = skills.filter((s) => s.source === "mcp");
+    $("set-mcp").replaceChildren(...(servers.length ? servers.map((s) => {
+      const [kind, text] = mcpStatus(s);
+      const folder = s.needs_folder ? el("div", { class: "mcp-folder small" }, "Folder: ",
+        s.folder ? el("code", {}, s.folder) : el("span", { class: "muted" }, "not chosen yet"),
+        el("button", { class: "btn small", type: "button", onclick: () => this.chooseMcpFolder(s) }, "Choose…")) : null;
+      return el("li", { class: "skill", "data-status": s.status }, toggle(s),
+        el("div", { class: "skill-body" },
+          el("div", { class: "skill-name" }, s.label, el("span", { class: "badge", "data-kind": kind }, text), asks(s)),
+          el("div", { class: "muted small" }, s.description), folder,
+          s.status === "error" && s.enabled ? el("div", { class: "small skill-error" },
+            s.error, s.log ? el("span", { class: "muted" }, ` (details: ${s.log})`) : null) : null));
+    }) : [el("li", { class: "muted small" }, "None configured yet.")]));
   },
-  async toggleSkill(name, on, input) {
+  async toggleSkill(s, on, input) {
+    if (on && s.needs_folder && !s.folder && !(await this.chooseMcpFolder(s))) {
+      input.checked = false;
+      return toast(`Choose a folder for ${s.label} first.`);
+    }
     try {
       state.config = await api("/api/skills", { method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name, enabled: on }) });
+        body: JSON.stringify({ name: s.name, enabled: on }) });
     } catch (err) {
       input.checked = !on;
       return toast(`Couldn't switch that skill: ${err.message}`, "error");
     }
+    this.skillsChanged();
+  },
+  // The folder an MCP server works in (the files server): GNOME's folder chooser, then reconnect it.
+  async chooseMcpFolder(s) {
+    let res;
+    try {
+      res = await api("/api/pick-folder", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: `Choose the folder for ${s.label}`, start: s.folder || "" }) });
+    } catch (err) {
+      toast(`Couldn't open the folder chooser: ${err.message}`, "error");
+      return false;
+    }
+    if (!res.path) return false;
+    try {
+      state.config = await api("/api/mcp/folder", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: s.name, folder: res.path }) });
+    } catch (err) {
+      toast(`Couldn't use that folder: ${err.message}`, "error");
+      return false;
+    }
+    this.skillsChanged();
+    return true;
+  },
+  skillsChanged() {
     applySkills();
     this.renderSkills(state.config.skills);
-    if (state.config.skills.some((s) => s.status === "starting")) setTimeout(() => this.load(), 1500);
+    clearTimeout(this.skillPoll);
+    // A server takes a few seconds to start: follow it until it's connected (or failed).
+    if (state.config.skills.some((s) => s.status === "starting")) this.skillPoll = setTimeout(() => this.refreshSkills(), 1000);
+  },
+  async refreshSkills() {
+    try { state.config.skills = await api("/api/skills"); } catch { return; }
+    this.skillsChanged();
+  },
+  async reloadMcp() {
+    $("reload-status").textContent = "Reloading…";
+    let res;
+    try {
+      res = await api("/api/mcp/reload", { method: "POST" });
+    } catch (err) {
+      $("reload-status").textContent = "";
+      return toast(`Couldn't reload: ${err.message}`, "error", 9000);
+    }
+    const { changes, ...config } = res;
+    state.config = config;
+    const parts = [["added", "Added"], ["changed", "Restarted"], ["removed", "Removed"]]
+      .filter(([k]) => changes[k].length).map(([k, label]) => `${label}: ${changes[k].join(", ")}`);
+    $("reload-status").textContent = parts.length ? parts.join(" · ") : "No changes in config.toml.";
+    this.skillsChanged();
   },
   renderIndex(k) {
     let text;
@@ -1132,6 +1202,15 @@ const settingsUI = {
       if (await this.save({ stt: e.target.value })) toast(`Switching speech-to-text to ${e.target.value}.`);
     });
     $("pick-folder").addEventListener("click", () => this.pickFolder());
+    $("reload-mcp").addEventListener("click", () => this.reloadMcp());
+    $("open-config").addEventListener("click", async () => {
+      try {
+        const r = await api("/api/config/open", { method: "POST" });
+        toast(`Opened ${r.path}. Save it, then press Reload servers.`);
+      } catch (err) {
+        toast(`Couldn't open config.toml: ${err.message}`, "error");
+      }
+    });
     $("use-folder").addEventListener("click", async () => {
       const path = $("set-folder").value.trim();
       if (await this.save({ knowledge_folder: path })) toast(path ? `Knowledge folder set to ${path}` : "Knowledge folder cleared");

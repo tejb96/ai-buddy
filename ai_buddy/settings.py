@@ -48,12 +48,15 @@ class Settings:
                          "knowledge_folder": cfg.rag.folder}
         self.values = dict(self.defaults)
         self.skills: dict[str, bool] = {}    # skill switches flipped in the app (override skills.enabled)
+        self.mcp_folders: dict[str, str] = {}   # the folder picked for each MCP server that uses {folder}
         self._listeners: list[Callable[[str, str], None]] = []
         try:
             saved = json.loads(self.path.read_text())
             self.values.update({k: v for k, v in saved.items() if k in self.KEYS and isinstance(v, str)})
             if isinstance(saved.get("skills"), dict):
                 self.skills = {k: v for k, v in saved["skills"].items() if isinstance(k, str) and isinstance(v, bool)}
+            if isinstance(saved.get("mcp_folders"), dict):
+                self.mcp_folders = {k: v for k, v in saved["mcp_folders"].items() if isinstance(v, str)}
         except FileNotFoundError:
             pass
         except (OSError, ValueError) as e:
@@ -93,10 +96,15 @@ class Settings:
         self.skills[name] = on
         self._save()
 
+    def set_mcp_folder(self, name: str, folder: str) -> None:
+        self.mcp_folders[name] = folder
+        self._save()
+
     def _save(self) -> None:
         """Only choices that differ from config.toml are saved, so a new default there still applies."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
         chosen = {k: v for k, v in self.values.items() if v != self.defaults[k]}
-        tmp.write_text(json.dumps({**chosen, "skills": self.skills}, indent=2))
+        extra = {"mcp_folders": self.mcp_folders} if self.mcp_folders else {}
+        tmp.write_text(json.dumps({**chosen, "skills": self.skills, **extra}, indent=2))
         tmp.replace(self.path)

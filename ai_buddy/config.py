@@ -92,7 +92,9 @@ class McpServerCfg:
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
     url: str = ""                   # ... or a remote one (Streamable HTTP)
+    headers: dict[str, str] = field(default_factory=dict)  # for a URL, e.g. Authorization = "Bearer ${TOKEN}"
     description: str = ""           # what it's for (shown in the app and to the model)
+    tools: list[str] = field(default_factory=list)          # only these of its tools (default: all)
     auto_approve: list[str] = field(default_factory=list)   # tools that may run without asking ("*" = all)
     timeout_s: float = 30
 
@@ -155,6 +157,7 @@ class AppCfg:
 
 @dataclass
 class Config:
+    path: Path | None = None        # the file this was read from (not a section)
     lemonade: LemonadeCfg = field(default_factory=LemonadeCfg)
     models: ModelsCfg = field(default_factory=ModelsCfg)
     chat: ChatCfg = field(default_factory=ChatCfg)
@@ -194,11 +197,12 @@ def load_config(path: str | os.PathLike | None = None) -> Config:
     """Read the TOML file (default: ./config.toml); missing sections fall back to defaults."""
     path = Path(path or os.environ.get("AI_BUDDY_CONFIG", DEFAULT_CONFIG))
     raw = tomllib.loads(path.read_text()) if path.exists() else {}
-    cfg = Config()
-    for f in fields(Config):
-        if f.name in raw:
-            setattr(cfg, f.name, _build(type(getattr(cfg, f.name)), raw[f.name]))
-    unknown = set(raw) - {f.name for f in fields(Config)}
+    cfg = Config(path=path)
+    sections = [f.name for f in fields(Config) if f.name != "path"]
+    for name in sections:
+        if name in raw:
+            setattr(cfg, name, _build(type(getattr(cfg, name)), raw[name]))
+    unknown = set(raw) - set(sections)
     if unknown:
         raise ValueError(f"Unknown section(s) in {path}: {', '.join(sorted(unknown))}")
     return cfg

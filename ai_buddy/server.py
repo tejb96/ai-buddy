@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from .config import Config
+from .config import Config, load_config
 from .knowledge import KnowledgeBase
 from .lemonade import TTS_SAMPLE_RATE, Lemonade, LemonadeError
 from .models import ModelManager
@@ -62,7 +62,8 @@ def create_app(cfg: Config, shutdown: Callable[[], None] | None = None) -> FastA
     lm = Lemonade(cfg.lemonade.base_url, cfg.lemonade.load_timeout_s)
     models = ModelManager(lm, cfg, llm=settings.llm, voice=settings.voice, stt=settings.stt)
     skills = SkillSet.from_config(cfg, settings.skills)
-    mcp = McpManager(cfg, skills)
+    timezone = local_timezone()
+    mcp = McpManager(cfg, skills, folders=settings.mcp_folders, timezone=timezone)
     coach = skills.skills.get("speaking-coach")
     scenarios = coach.modules["modes"].SCENARIOS if coach and "modes" in coach.modules else {}
     store = Store(cfg.app.data_path, voice_name(models.voice), scenarios)
@@ -74,7 +75,7 @@ def create_app(cfg: Config, shutdown: Callable[[], None] | None = None) -> FastA
                               chunk_overlap=cfg.rag.chunk_overlap, max_file_mb=cfg.rag.max_file_mb,
                               watch=cfg.rag.watch, embed=models.embed if cfg.models.embed else None,
                               embed_model=cfg.models.embed)
-    svc = Services(cfg, lm, models, store, skills, ToolContext(cfg, web, knowledge, local_timezone()), knowledge)
+    svc = Services(cfg, lm, models, store, skills, ToolContext(cfg, web, knowledge, timezone), knowledge)
     allowed_origins = {f"http://{h}:{cfg.app.port}" for h in ("127.0.0.1", "localhost", cfg.app.host)}
     notes_running = False
     sessions: set[Session] = set()      # one per open window
@@ -213,6 +214,47 @@ def create_app(cfg: Config, shutdown: Callable[[], None] | None = None) -> FastA
         log.info("Exit: models unloaded=%s, stopping=%s", unloaded, shutdown is not None)
         return {"unloaded": unloaded, "stopping": shutdown is not None}
 
+    # ---------- MCP servers ----------
+
+    @app.post("/api/mcp/folder", dependencies=[Depends(same_origin)])
+    async def mcp_folder(body: dict):
+        """The folder an MCP server that uses {folder} works in (the files server); reconnects it."""
+        name = str(body.get("name", ""))
+        path = Path(os.path.expanduser(str(body.get("folder", "")).strip()))
+        if name not in mcp.servers or not mcp.servers[name].needs_folder:
+            raise HTTPException(400, f"{name!r} is not an MCP server that uses a folder")
+        if not path.is_dir():
+            raise HTTPException(400, f"Not a folder: {path}")
+        settings.set_mcp_folder(name, str(path))
+        await mcp.set_folder(name, str(path))
+        return config_view()
+
+    @app.post("/api/mcp/reload", dependencies=[Depends(same_origin)])
+    async def mcp_reload():
+        """Re-read [mcp.servers] from config.toml: new servers appear, removed ones go, changed ones restart."""
+        try:
+            fresh = load_config(cfg.path)
+        except (OSError, ValueError) as e:
+            raise HTTPException(400, f"config.toml has a problem: {e}") from e
+        changes = await mcp.reload(fresh.mcp.servers)
+        cfg.mcp = fresh.mcp
+        return {"changes": changes, **config_view()}
+
+    @app.post("/api/config/open", dependencies=[Depends(same_origin)])
+    async def open_config():
+        """Open config.toml in the default text editor."""
+        if not cfg.path or not cfg.path.is_file():
+            raise HTTPException(404, "config.toml not found")
+        await asyncio.create_subprocess_exec("xdg-open", str(cfg.path), stdout=subprocess.DEVNULL,
+                                             stderr=subprocess.DEVNULL)
+        return {"path": str(cfg.path)}
+
+    @app.post("/api/pick-folder", dependencies=[Depends(same_origin)])
+    async def pick_folder(body: dict):
+        """GNOME's folder chooser, for an MCP server's folder."""
+        return {"path": await choose_folder(str(body.get("title") or "Choose a folder"),
+                                            str(body.get("start") or Path.home()))}
+
     @app.get("/api/status")
     async def get_status():
         try:
@@ -284,18 +326,19 @@ def create_app(cfg: Config, shutdown: Callable[[], None] | None = None) -> FastA
         await asyncio.sleep(0.05)
         return knowledge.status()
 
-    @app.post("/api/knowledge/pick", dependencies=[Depends(same_origin)])
-    async def knowledge_pick():
-        """Open GNOME's folder chooser on the desktop and return the chosen path."""
+    async def choose_folder(title: str, start: str) -> str | None:
+        """Open GNOME's folder chooser on the desktop; the chosen path, or None."""
         if not shutil.which("zenity"):
             raise HTTPException(501, "zenity is not installed; type the folder path instead")
-        start = str(settings.knowledge_folder or Path.home()) + "/"
         proc = await asyncio.create_subprocess_exec(
-            "zenity", "--file-selection", "--directory", "--title=Choose the knowledge folder",
-            f"--filename={start}", stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            "zenity", "--file-selection", "--directory", f"--title={title}", f"--filename={start.rstrip('/')}/",
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         out, _ = await proc.communicate()
-        path = out.decode().strip()
-        return {"path": path or None}
+        return out.decode().strip() or None
+
+    @app.post("/api/knowledge/pick", dependencies=[Depends(same_origin)])
+    async def knowledge_pick():
+        return {"path": await choose_folder("Choose the knowledge folder", str(settings.knowledge_folder or Path.home()))}
 
     @app.post("/api/knowledge/open", dependencies=[Depends(same_origin)])
     async def knowledge_open(body: dict):
