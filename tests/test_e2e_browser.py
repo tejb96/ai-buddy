@@ -182,7 +182,7 @@ def test_settings_skills_mcp_and_voice_samples(page: Page):
     page.select_option("#set-voice", "af_bella")
     expect(page.locator(".persona-name").first).to_have_text("Bella", timeout=10_000)
     page.locator("#close-settings").click()
-    assert page.evaluate("settingsUI.sample") is None          # closing Settings stops a sample
+    page.wait_for_function("settingsUI.sample === null", timeout=5_000)      # closing Settings stops a sample
 
 
 def test_barge_in_from_browser(page: Page):
@@ -260,9 +260,10 @@ def test_history_view(page: Page):
     page.screenshot(path=ART / "09b-history-dark.png", full_page=True)
     page.emulate_media(color_scheme="light")
     rows.first.click()
-    expect(page.locator("dialog.detail")).to_be_visible()
+    expect(page.locator("#detail")).to_be_visible()
     page.screenshot(path=ART / "10-history-detail.png")
-    page.get_by_role("button", name="Close").click()
+    page.locator("#detail").get_by_role("button", name="Close").click()
+    expect(page.locator("#detail")).to_be_hidden()
 
 
 def test_hands_free(page: Page):

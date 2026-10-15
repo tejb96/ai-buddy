@@ -69,6 +69,8 @@ def chat_system_prompt(persona: Persona, tz_name: str, skill_instructions: list[
 
 CHAT_KICKOFF = "[The user just opened the app. Greet them in one short, natural sentence.]"
 NUDGE = "[You said you'd look it up but didn't call a tool. Call the tool now; don't announce it again.]"
+CLAIM_NUDGE = ("[You said it's done, but you didn't call a tool, so nothing happened. If one of your tools can do it, "
+               "call it now; otherwise tell the user you can't.]")
 
 
 def notes_block(hits, max_chars: int = 2500) -> str:

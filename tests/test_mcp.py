@@ -67,6 +67,7 @@ async def test_a_broken_server_reports_an_error(tmp_path):
 
 async def test_manager_follows_the_skill_switch(tmp_path):
     cfg: Config = load_config()
+    cfg.app.data_dir = str(tmp_path)            # server logs go here, not to the real data folder
     cfg.mcp.servers = {"todo": server_cfg(tmp_path)}
     skills = SkillSet(discover(), ["clock"])
     manager = McpManager(cfg, skills)

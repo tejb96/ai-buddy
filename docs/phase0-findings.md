@@ -1,55 +1,42 @@
-# Kira: findings and handoff
+# AI Buddy: findings and handoff
 
 Sessions of 2026-10-14 on the ThinkPad P14s Gen 6 AMD (Ryzen AI 7 PRO 350, XDNA 2 NPU, Radeon 860M, 64 GB),
-Lemonade 2026.41.1 with FLM v1.0.6, Kokoro b21. Work is on branch `kira-agent` (merged into `main` at the end
-of session 3). Benchmark scripts are in [`scripts/bench/`](../scripts/bench/README.md).
+Lemonade 2026.41.1 with FLM v1.0.6, Kokoro b21. Work is on `main` since session 4. The assistant was called Kira
+until session 4; it is now named after its voice (Bella by default). Benchmark scripts are in
+[`scripts/bench/`](../scripts/bench/README.md); the plan ahead is in [ROADMAP.md](ROADMAP.md).
 
-## Start here (handoff after session 3)
+## Start here (handoff after session 4)
 
-**Where things stand:**
-- **Step 1 (validate Gemma 12B) is done.** Gemma 4 12B with audio input passed and is now the default chat model, with the 35B as an option. Whisper provides the chat transcript.
-- **Step 2 (skills build) is mostly built.** Skills, MCP, the router, asking permission, audio chat and the embedding code are covered by 171 unit tests that run without models. **Nothing in Step 2 has run against the real models or in the real app yet.**
-- **Not started:** README, ROADMAP, GitHub description, and Step 3 (verification).
-
-The user ended the session here: finish the running test, record the results, hand off, run the unit tests, commit and merge.
+**Where things stand:** all six steps of session 4 are done; open items below. See "Session 4" below; the README describes the app
+as it is now.
 
 **Next, in this order:**
-1. **Smoke-test the real app** (`uv run ai-buddy`):
-   - one spoken chat with a tool call and a notes lookup;
-   - one practice session.
+1. **GitHub MCP server**, once the user provides a token: README "GitHub" has the steps (`secrets.env`, uncomment
+   a block in `config.toml`, Reload servers). Then test it with a spoken request, as the files/fetch/time servers
+   were.
+2. **The user tries Whisper-Large-v3-Turbo** (Settings → Speech-to-text; whisper.cpp on the CPU, not benchmarked).
+   If it should run on the iGPU instead, that needs `lemonade backends install whispercpp:vulkan` and
+   `models.stt_backend = "vulkan"`: ask first (GPU backends were removed at the user's request).
+3. **Set `[user] location`** (ask the user for their city). The 9B reads "my sister is visiting from Vancouver…
+   downtown?" as downtown Vancouver (3 of 3 e2e runs, even with a prompt rule naming the case; that test is
+   `xfail`). With a location, "downtown", "nearby" and "weather" have a meaning.
+4. **Watch in real use:** the 9B's reply length (one 86-word answer in the test set), and whether it asks in words
+   before a tool that asks anyway (seen once, see Step 5).
+5. **A Whisper stall:** once in the last browser run, an FLM Whisper request hung for 30 s (then the retry worked).
+   Rerun `uv run pytest tests/test_e2e_browser.py -m lemonade -k hands_free -s`; if it recurs, check Lemonade's log
+   and whether a shorter first-attempt timeout plus retry would hide it.
+6. **After `scripts/update-flm.sh`** (FLM 1.0.8; the user runs it, it needs sudo), re-check: concurrent Whisper +
+   LLM and `--preemption`, `tool_choice`, the decode speeds.
 
-   Expect bugs: the new session code (audio turns, NPU lock, skills, router, permission card) has only met fakes so far.
-2. **Step 3 tests:**
-   - Update and run the end-to-end tests. `tests/conftest.py` already gives the test server sample notes and a test MCP server (`tests/fixtures/mcp_notes_server.py`).
-   - Still to do in the backend tests: drop the latency asserts (`first_audio < 6`); add scenario tests against the real model for:
-     - a tool turn and a notes turn;
-     - the MCP to-do list, where `todo_add_item` asks first and `todo_list_items` doesn't;
-     - no-guessing ("Where am I going on my trip next month?", "my sister is visiting from Vancouver… downtown?").
-   - Browser tests: the skill switches in Settings, the permission card, and practice tabs hiding when the coach is off.
-   - Then run the full suite.
-3. **CPU embeddings** (code ready; `models.embed = ""` until then):
-   - Run `lemonade backends install llamacpp:cpu` and `lemonade pull Qwen3-Embedding-0.6B-GGUF`.
-   - Check that the app's `/load` options (`llamacpp_backend: "cpu"`, `llamacpp_args: "--threads 4"`, in `ModelManager._options`) are the right keys: `/v1/health` must show the model with device `cpu`, never the iGPU.
-   - Set `models.embed`, re-index, and check retrieval on real notes. Fall back to `nomic-embed-text-v1-GGUF` if Qwen3 doesn't work well (prompt formats for both are in `knowledge.EMBED_FORMATS`).
-   - Then delete `embed-gemma-300m-FLM`.
-4. **Delete `gemma4-it-e4b-FLM`** (`lemonade delete gemma4-it-e4b-FLM`; already decided). `gemma4e-flash-e4b-FLM` uses the same files (`Gemma4-E4B-IT-NPU2`), so it goes too.
-5. **Docs:**
-   - Rewrite the README for the new positioning: a local voice AI agent with plug-in skills, a voice-first coach and creative partner. Describe only what's built; planned skills go under a roadmap.
-   - Update the GitHub description with `gh repo edit tejb96/ai-buddy --description …`.
-   - Write `docs/ROADMAP.md` from "Roadmap direction" below.
-6. **After `scripts/update-flm.sh`** (FLM 1.0.8; the user runs it, it needs sudo), re-check:
-   - concurrent Whisper + LLM, and `--preemption`;
-   - `tool_choice`;
-   - Gemma's decode speed.
-
-**Rules the user set** (also in the session prompt):
-- **Efficiency first.** It's a laptop: use the NPU where a model can run there. CPU or GPU only for models that exist only there (Kokoro and the embeddings on the CPU). No latency benchmarks.
-- **No extra cost per turn.** Don't add tokens or LLM calls to every turn unless they clearly pay for themselves.
-- **No guessing.** Kira uses a tool or says she doesn't know, and never invents details (cities, personal stories). Unambiguous intents are enforced in code.
-- **Spoken style.** Plain sentences; details and sources go on screen.
+**Rules the user set** (also in the session prompts):
+- **Efficiency first.** It's a laptop: models on the NPU where possible; CPU or GPU only where a model needs it
+  (Kokoro, the note embeddings and the optional whisper.cpp on the CPU). No latency benchmarks.
+- **No extra cost per turn** unless it clearly pays for itself.
+- **No guessing.** Use a tool or say you don't know; never invent details. Questioned facts are re-checked.
+- **Spoken style.** Plain sentences; details and sources on screen.
 - **Ask before acting.** Skills that change something ask first.
-- **Built-in models only.** Use models from Lemonade's built-in registry, never custom `user.*` models.
-- **Settings.** App-level Lemonade/FLM settings are preferred; no sudo without asking; record every change here.
+- **Built-in models only** (Lemonade's registry, no `user.*` models).
+- **Settings.** App-level Lemonade/FLM settings are preferred; no sudo without asking; record changes here.
 - **Commit as you go.** If the context gets long, write a handoff and stop.
 
 ## Decisions
@@ -57,16 +44,234 @@ The user ended the session here: finish the running test, record the results, ha
 | Topic | Decision |
 |---|---|
 | Priorities | Answer quality, no fabrication, and efficiency (power, heat, fan noise) over raw latency. A reply starting within ~4 s is acceptable if it is more accurate. |
-| Where models run | LLM and speech-to-text on the NPU through Lemonade/FLM. Kokoro TTS and the note embeddings on the CPU. No iGPU models. |
-| LLM | **`gemma4-it-12b-FLM` with audio input** (session 3, Step 1): one model for chat, tools and coaching, thinking off, no swapping. `qwen3.6-moe-35b-a3b-FLM` (reads Whisper's text) and `qwen3-it-4b-FLM` stay selectable (`models.llm_choices`, the settings dialog). |
-| Speech-to-text | `whisper-v3-turbo-FLM` (NPU) for the chat transcript (bubble, history, router) and always for practice modes (verbatim, filler counts). Gemma's own transcript is an option (`chat.transcript = "heard"`) but not accurate enough to be the default. |
-| One NPU job at a time | Whisper and the LLM never run at the same moment (concurrent requests corrupted both results). The app serializes them. |
-| Connectors | **GAIA dropped.** MCP servers become skills through the official MCP Python SDK (`mcp` 2.3.0). Kira's own capabilities are skills in the Agent Skills `SKILL.md` format. |
-| Embeddings | `Qwen3-Embedding-0.6B-GGUF` on llama.cpp's **CPU** backend (fallback `nomic-embed-text-v1-GGUF`), from Lemonade's built-in registry only. Search is hybrid: embeddings plus BM25. Code done; Lemonade setup pending, so `models.embed = ""` for now. |
-| Models to delete | `gemma4-it-e4b-FLM` (failed the quality test; not deleted yet). `embed-gemma-300m-FLM` once CPU embeddings work. |
+| Where models run | LLM and speech-to-text on the NPU through Lemonade/FLM. Kokoro TTS and the note embeddings on the CPU (the optional whisper.cpp Whisper too). No iGPU models. |
+| Pipeline | **Whisper's transcript → the LLM** (session 4). Gemma hearing the recording itself misheard real speech; audio input is gone. |
+| LLM | **`qwen3.5-9b-FLM`**, thinking off (session 4, after the reduced test set). `gemma4-it-12b-FLM` and `qwen3.6-moe-35b-a3b-FLM` stay in Settings (`models.llm_choices`); `qwen3-it-4b-FLM` left the list. |
+| Speech-to-text | `whisper-v3-turbo-FLM` (NPU) for everything. Option: `Whisper-Large-v3-Turbo` on whisper.cpp, CPU (`models.stt_choices`, `stt_backend`), for the user to try. |
+| One NPU job at a time | Whisper and the LLM never run at the same moment (concurrent requests corrupted both results). The app serializes FLM jobs; CPU Whisper skips the lock. |
+| The assistant | Named after its voice (session 4): `af_bella` → **Bella** by default; `persona.name` is gone. |
+| Connectors | **GAIA dropped.** MCP servers are skills through the official MCP Python SDK (`mcp` 2.3.0): files, fetch and time ready to switch on; any other via `config.toml` + Reload servers; secrets in `<data_dir>/secrets.env`. GitHub documented, untested (no token). |
+| Corrections | A fact the user questions is checked again by the app (router), compared figure by figure, and never credited to a source that doesn't show it. |
+| Embeddings | `Qwen3-Embedding-0.6B-GGUF` on llama.cpp's **CPU** backend, context 8192 (1.6 GB), hybrid with BM25; meaning-only matches need cosine ≥ 0.38; practice uses a strict search. Done in session 4. |
+| Models to delete | Nothing left: `embed-gemma-300m-FLM` and the E4B models are not downloaded. |
 | FLM 1.0.8 | The user runs `scripts/update-flm.sh` (sudo). Don't block on it. |
-| Voice | `af_heart` default; selectable in the app (9 curated Kokoro voices with a preview). |
-| Web search | DuckDuckGo's HTML endpoint, no API key; self-hosted SearXNG optional (`tools.search_backend`). |
+| Voice | `af_bella` default; 9 curated Kokoro voices in Settings, one sample at a time. |
+| Web search | DuckDuckGo's HTML endpoint, no API key; SearXNG optional. Results carry each page's "as of" time; live questions go by the newest source. |
+| Exit | The power button stops the app, unloads every model from Lemonade and closes the window. |
+
+## Session 4: Whisper's text, qwen3.5-9b, real-use fixes, corrections, MCP
+
+### Step 1: back to Whisper's text; qwen3.5-9b-FLM is the default
+
+**Why:** in real use Gemma 12B hearing the recording misheard the user ("yo what's up" → "yo wossa"; "which model
+are you?" answered as a different question) where Whisper's transcript was right. The pipeline is now: Whisper
+(FLM, NPU) transcribes; the LLM reads that text. Audio input, the `<heard>` mode, recordings in the history and
+`chat.audio_input` / `chat.transcript` are gone (the Gemma benches keep their old prompts in
+`scripts/bench/common.py`).
+
+**Sanity check** (`REDUCED=1 PAUSE_S=3 audio_llm.py whisper:qwen3.5-9b-FLM tools,multi,understand`; the test
+prompts still say "Kira", so the bench prompt keeps that name):
+
+| | qwen3.5-9b (Whisper text) | Gemma 12B (audio in, earlier runs) |
+|---|---|---|
+| Tool choice, 10 spoken prompts | 8/10 | 9/10 |
+| Misses | "today's date" answered from the prompt (correct); Paris "time there" skipped | Paris "time there" skipped |
+| No guessing in multi-turn | 3/3 | 3/3 |
+| Understanding, 4 requests | 4/4. Priya: asked which city "downtown" meant | Priya: made up Toronto |
+| Spoken-style breaks | 1 (86 words, a quoted email) | 0 |
+| Blank tool names, `<think>` leaks | none | none |
+
+No fabrication; not a clear failure, so it became the default (`gemma4-it-12b-FLM`, `qwen3.6-moe-35b-a3b-FLM` stay
+in Settings; the 4B left the list). Decode ~10 tok/s (FLM's own numbers), against ~6.3 for Gemma 12B. Thermal over
+the run: Tctl avg 55.3 °C (max 62.1), package power avg 11.4 W, fan avg 2,850 RPM. `think: false` is honored
+when streaming. The Paris miss is covered by the router in the app.
+
+The saved `settings.json` pinned `llm = gemma4-it-12b-FLM` (written when it was the default), so it was removed,
+and settings now only save choices that differ from `config.toml`.
+
+### Step 2: Whisper-Large-v3-Turbo (whisper.cpp) as an option
+
+Installed `whispercpp:cpu` (v1.8.4) and pulled `Whisper-Large-v3-Turbo` (1.6 GB). Settings → Speech-to-text offers
+it (`models.stt_choices`); the app loads it with `whispercpp_backend` from `models.stt_backend` (default `cpu`;
+`/v1/health` shows `recipe_options.whispercpp_backend: cpu`, device `cpu`). One functional transcription was right.
+CPU Whisper skips the NPU lock. Not benchmarked: the user tries it.
+
+### Step 3: bugs from real use
+
+- **Scrolling:** every streamed word called `scrollIntoView({block: "end"})`, which put the message under the
+  floating dock and fought the user's scrolling. Now the view follows only while you're at the bottom (within
+  48 px); a wheel/key scroll up stops following at once, and a "↓ Latest" button jumps back. Verified in headless
+  Chrome: scrollY unchanged while 10 more deltas arrived.
+- **Voice samples:** each preview was a new `Audio()`, so they overlapped. Now one sample element: a new pick
+  stops the old one (and its synthesis), there's a Stop button, closing Settings stops it, and a sample that
+  finishes saving after Settings closed doesn't play.
+- **Name follows the voice:** `persona.name` is gone (a clear error if an old config has it); the name is the
+  first word of the voice's label (`settings.voice_name`), Bella by default (`af_bella`). Prompt, UI, coach skill,
+  preview line ("Hi, I'm Emma") and saved transcripts follow the voice.
+- **Exit:** a power button. `POST /api/exit` stops every session (feedback too), cancels the startup load, unloads
+  every model from Lemonade (`POST /v1/unload {}`), refuses new connections, and stops the server; `__main__`
+  then terminates the app window it opened, and the page tries `window.close()` and otherwise says it stopped.
+  Verified: Lemonade had no models loaded afterwards and the process exited.
+- Found on the way: after the first chat message, switching a skill threw (`#chat-skills-line` had left the page
+  with the empty-chat panel), which stopped Settings from updating after a toggle.
+
+### Step 4: corrections are checked, not accepted
+
+- **Prompt:** a standing rule (don't just agree, don't invent a reason, check again, give both if sources differ)
+  and "for live data, go by the most recent source; if results don't contain the answer, say so plainly".
+- **Code:** `router.recheck`: when the user questions an answer that came from tools (explicit doubt, or a
+  counter-claim with a figure in it: "isn't it 16 degrees and feels like 12?", "my app says 16"), the read-only
+  calls of that exchange run again (a web search with `double_check`, which reads one more source). The results go
+  back with a compare-figure-by-figure instruction, plus `recheck_note`: the user's figures that appear in no result
+  (dates and times like "Fri Oct 16" or "12am" don't count), "don't say a source shows them".
+- **Why the note:** the first live test (Calgary weather, user claims 16 / feels 12) got "You're right, The Weather
+  Network shows 16 and feels like 12": no result said that. With the stricter instruction it answered "The Weather
+  Network shows 13 feeling like 15, which differs from what you mentioned". Calculator: "isn't it 45?" → re-checked,
+  "43.2, not 45".
+- **Live data:** each web result carries `as_of` (the page's own metadata, then visible stamps such as "Observed at
+  6:00 PM" or "Updated 7 minutes ago", then `<time>` tags, then Last-Modified; zone-less future times are read as
+  UTC; nothing more than 2 h ahead). For live queries one more page is tried and the newest come first, with a note.
+  A first version took the latest of all dates on a page and ranked an NHL.com page from 2024 first (its sidebar
+  had today's dates); fixed by trusting the page's own metadata first. `checked_at` is in every web result.
+
+### Step 5: MCP, real and visible
+
+**Servers** (in `config.toml`, off until switched on; versions pinned):
+- `files`: `@modelcontextprotocol/server-filesystem@1.0.0` (npx), in a folder chosen in Settings (`{folder}`).
+  8 of its 14 tools are exposed (`tools`): read_text_file, list_directory, search_files, get_file_info,
+  write_file, edit_file, create_directory, move_file. The duplicates and extras are dropped to save prompt space
+  and to help a 9B choose.
+- `fetch`: `mcp-server-fetch==2026.10.10` (uvx).
+- `time`: `mcp-server-time==2026.10.10 --local-timezone {timezone}` (uvx).
+
+**Annotations, checked against the real servers:** the filesystem server's read tools have `readOnlyHint: true`;
+write, edit, move and create-directory don't, so they ask first. fetch and time are all read-only. No
+`auto_approve` was needed.
+
+**Runtimes:** Node 24.16 (nvm) and uv 0.11.21 were already installed; no sudo. The desktop launcher's PATH lacks
+nvm, so `find_command` also looks in nvm's newest Node and `~/.local/bin`, and puts that folder on the server's PATH.
+
+**Settings → MCP servers:**
+- a switch and status per server (Connected · N tools / Connecting… / Error with the reason and the log file /
+  Off), and the files folder with Choose…;
+- "Add a server": a snippet, Open config.toml, and Reload servers (re-reads `[mcp.servers]`: adds, removes and
+  restarts what changed, no app restart).
+
+**Also new:** `${NAME}` secrets from `<data_dir>/secrets.env` (or the environment) in command/args/env/headers;
+`headers` for URL servers; per-server logs in `<data_dir>/logs/`.
+
+**Spoken tests in the real app** (`uv run ai-buddy` on :8765; headless Chrome with the scripted microphone and
+Kokoro speech; switches flipped in the real Settings panel):
+
+| Server | Said | Result |
+|---|---|---|
+| time (clock skill off) | "What time is it in Tokyo right now?" | `time_get_current_time` → "It's 9:36 AM on Thursday in Tokyo" (right) |
+| files | "Can you list the files in my folder?" | First: asked for the folder's path. After the instructions said "my folder" means this one: `files_list_directory` → "two files: Shopping.txt and ideas.md" |
+| files | "Please create a file called shopping.txt with milk, eggs and bread." then "Yes, go ahead." | `files_write_file`: the app asked (card + spoken question), the spoken yes approved it, the file was written |
+| fetch (web search off) | "Please fetch the web page at example dot org…" | First: `url: "example.org"` refused by the server (needs a scheme). After bare domains get `https://`: fetched and summarized |
+
+**Fixes from those runs:**
+- Switching a skill after the first chat message threw (`#chat-skills-line` had left the page with the empty-chat
+  panel), so Settings never showed the new state.
+- The spoken question read the whole path and the file's contents; it's now "Should I write file “Shopping.txt”
+  using files?", with every argument on the card.
+- The answer ran into the question ("…?Got it!").
+- JSON results showed "{" as their summary.
+
+**Seen once:** in a turn where two requests had merged (a test-script race), the model asked in words "shall I go
+ahead and make it?" instead of calling write_file, which would then ask again. In a clean turn it called the tool
+directly.
+
+**Automation slip:** an early run clicked the Files switch before the panel had refreshed, so the app opened
+zenity's folder chooser on the user's desktop; the user closed it. Scripted runs now set folders through the API
+and wait for the panel.
+
+**GitHub:** documented, not tested (no token yet): README "GitHub", and two commented `[mcp.servers.github]` blocks
+in `config.toml`. One is the release binary (v2.0.2, `github-mcp-server stdio` with `GITHUB_TOOLSETS =
+repos,issues,pull_requests` and `GITHUB_READ_ONLY = 1`); the other is `https://api.githubcopilot.com/mcp/readonly`
+with `Authorization = "Bearer ${GITHUB_TOKEN}"`.
+
+### Step 6: smoke test, CPU embeddings, end-to-end tests, docs
+
+**Real-app smoke test** (`uv run ai-buddy`, headless Chrome, scripted microphone, embeddings on; the MCP runs
+above count as its MCP part):
+
+| What | Said / done | Result |
+|---|---|---|
+| Greeting | — | "Hi there, I'm Bella—how's your day going so far?" |
+| Tool call | "What's the weather in Calgary right now?" | routed web search → "clear and windy… around 13 degrees… the most recent data is from this evening" |
+| Notes lookup (the user's resume PDF) | "What does my resume say about my most recent job?" | `search_notes` → role, dates, stack and the ~40% saving, all as in the PDF |
+| Presentation | 40 s talk with fillers and a 3 s pause | numbers 3 s after Stop (134 wpm, 8 fillers, 1 long pause of 4 s), full feedback 56 s after Stop; no page errors |
+
+**Found:** the presentation feedback had a "Talking points" section built from the resume, for a talk about sleep.
+The talking-points search always returned the nearest passages: embeddings rank everything, and BM25 matched the
+resume on "learning", "points", "deep". Fixed:
+- passages found only by meaning need a cosine similarity of at least 0.38;
+- practice background and talking points search strictly (close in meaning, not just a shared word).
+
+Measured on the real notes (Qwen3-Embedding, instructed queries): questions about the resume scored 0.39–0.53,
+unrelated ones at most 0.35. "MailBott" scores only 0.31 in meaning, but keyword search finds it, and chat keeps
+keyword hits. After the fix: sleep-talk talking points → none; job-interview background → the resume; "what's in my
+notes about the budget?" → nothing (it used to return resume passages).
+
+**CPU embeddings:**
+- **Setup:** `llamacpp:cpu` (b10825) and `Qwen3-Embedding-0.6B-GGUF` are installed and pulled; `models.embed` is set.
+- **Placement:** `/v1/health` shows device `cpu`, `llamacpp_backend: cpu`, `--threads 4 --parallel 1`, loaded next to
+  the 9B, Whisper and Kokoro with no evictions.
+- **Memory:** Lemonade's default 64k context made it take 7.7 GB of RAM, so it now loads with
+  `models.embed_ctx_size = 8192` (1.6 GB).
+- **Quality and speed:** 16 note chunks (4.7k tokens) embed in ~12 s on 4 threads. The right passage came first for
+  5/5 test questions.
+- **Clean-up:** nothing left to delete. `embed-gemma-300m-FLM` and the E4B models (`gemma4-it-e4b-FLM`, `gemma4e-flash-e4b-FLM`) are not downloaded. `qwen3-it-4b-FLM` (3.1 GB) is still downloaded but no longer offered in Settings.
+
+**End-to-end tests** (`uv run pytest -m lemonade`; real models, Kokoro speech in; latency no longer asserted):
+- **Backend:** all pass. The new scenarios:
+  - a routed clock turn and a notes turn;
+  - the MCP to-do list (add asks first, list doesn't);
+  - not guessing a trip;
+  - "isn't it 45?" → re-checked, "43.2, not 45";
+  - both practice modes with full feedback (46–48 s).
+
+  "Where is downtown" (Priya, visiting *from* Vancouver) is `xfail`: the 9B searched downtown Vancouver in 3 of
+  4 runs, and passed once.
+- **Browser:** 17 of 22 passed on the first run.
+  - A pre-existing test bug (`dialog.detail` matched the Settings dialog too) left the session dialog open and
+    took two later tests down with it.
+  - The voice-sample check raced the dialog's close event.
+  - The permission-card test exposed the next item.
+- **The model claimed an action it never took.** For "Please add buy bread to my to-do list" it answered "Got it!
+  'Buy bread' has been added", with no tool call: nothing was added and nothing was asked (1 of 4 runs of that
+  request; the other 3 called the tool).
+  - Now, when a request asks for a change and a tool that changes something is on, each round is held until it's
+    complete. A claim of having done it ("added", "saved"…) without a tool call is dropped unheard, and the model
+    is told nothing happened (`CLAIM_NUDGE`); it then calls the tool, which asks as usual.
+  - Without such tools (the default skills), nothing is held.
+- **To-do follow-up:** after adding an item, "what's on my to-do list?" was answered from memory, with a slip
+  ("almond milk" for oat milk). MCP skill instructions now say their contents can change outside the chat, so look
+  them up; it then called `todo_list_items`.
+- **Browser rerun** after those fixes: 10 of 11 passed, including the permission card and the MCP backend test.
+  `test_hands_free` failed because Whisper's first attempt stalled for its full 30 s timeout (empty error). The retry
+  landed just past the test's 30 s window. First time a stall like this was seen; not investigated (open, see Start
+  here).
+- **Unit tests:** 205, no models needed. One MCP test wrote a log into the real data folder; it now uses a temporary
+  one.
+
+**Docs:** the README was rewritten for what's built, and [ROADMAP.md](ROADMAP.md) was written from the roadmap
+direction (built vs. planned, no invented order). The GitHub description was updated.
+
+### Lemonade / system changes in session 4
+
+- Pulled `qwen3.5-9b-FLM` (8.7 GB), `Whisper-Large-v3-Turbo` (1.6 GB), `Qwen3-Embedding-0.6B-GGUF` (0.6 GB).
+- Installed backends `whispercpp:cpu` (v1.8.4) and `llamacpp:cpu` (b10825). No GPU backends; no FLM settings changed.
+- npm/uv caches: `@modelcontextprotocol/server-filesystem@1.0.0`, `mcp-server-fetch==2026.10.10`,
+  `mcp-server-time==2026.10.10`.
+- `~/.local/share/ai-buddy/settings.json`: removed the saved `llm` (Gemma) so the new default applies. After the
+  real-app runs it was put back to `{"skills": {}}` (the test folder for the files server and the test switches
+  removed).
+- `~/.local/share/ai-buddy/buddy.db`: the six sessions the real-app runs created (18:30–18:46: MCP checks, smoke
+  test, a practice talk about sleep) were deleted so they don't show in History or the progress charts. The user's
+  own sessions (2026-10-13 22:06 and 2026-10-14 16:49) are untouched.
+- `~/.local/share/ai-buddy/logs/`: the app's MCP server logs from those runs (files, fetch, time).
 
 ## Session 3, Step 1: validating Gemma 4 12B with audio input
 
@@ -255,7 +460,55 @@ The user ended the session here: finish the running test, record the results, ha
 
 **Not done yet:** see "Start here". In short: real-model runs, the end-to-end tests, the app smoke test, the embedding setup, the README / ROADMAP / GitHub description, and the model deletions. Lemonade/FLM settings changed in session 3: **none**. The only Lemonade action was loading `gemma4-it-12b-FLM`, which evicted e4b from the LLM slot.
 
-## Roadmap direction (from the user; to become docs/ROADMAP.md)
+## Handoff after session 3 (superseded; kept for the record)
+
+**Where things stand:**
+- **Step 1 (validate Gemma 12B) is done.** Gemma 4 12B with audio input passed and is now the default chat model, with the 35B as an option. Whisper provides the chat transcript.
+- **Step 2 (skills build) is mostly built.** Skills, MCP, the router, asking permission, audio chat and the embedding code are covered by 171 unit tests that run without models. **Nothing in Step 2 has run against the real models or in the real app yet.**
+- **Not started:** README, ROADMAP, GitHub description, and Step 3 (verification).
+
+The user ended the session here: finish the running test, record the results, hand off, run the unit tests, commit and merge.
+
+**Next, in this order:**
+1. **Smoke-test the real app** (`uv run ai-buddy`):
+   - one spoken chat with a tool call and a notes lookup;
+   - one practice session.
+
+   Expect bugs: the new session code (audio turns, NPU lock, skills, router, permission card) has only met fakes so far.
+2. **Step 3 tests:**
+   - Update and run the end-to-end tests. `tests/conftest.py` already gives the test server sample notes and a test MCP server (`tests/fixtures/mcp_notes_server.py`).
+   - Still to do in the backend tests: drop the latency asserts (`first_audio < 6`); add scenario tests against the real model for:
+     - a tool turn and a notes turn;
+     - the MCP to-do list, where `todo_add_item` asks first and `todo_list_items` doesn't;
+     - no-guessing ("Where am I going on my trip next month?", "my sister is visiting from Vancouver… downtown?").
+   - Browser tests: the skill switches in Settings, the permission card, and practice tabs hiding when the coach is off.
+   - Then run the full suite.
+3. **CPU embeddings** (code ready; `models.embed = ""` until then):
+   - Run `lemonade backends install llamacpp:cpu` and `lemonade pull Qwen3-Embedding-0.6B-GGUF`.
+   - Check that the app's `/load` options (`llamacpp_backend: "cpu"`, `llamacpp_args: "--threads 4"`, in `ModelManager._options`) are the right keys: `/v1/health` must show the model with device `cpu`, never the iGPU.
+   - Set `models.embed`, re-index, and check retrieval on real notes. Fall back to `nomic-embed-text-v1-GGUF` if Qwen3 doesn't work well (prompt formats for both are in `knowledge.EMBED_FORMATS`).
+   - Then delete `embed-gemma-300m-FLM`.
+4. **Delete `gemma4-it-e4b-FLM`** (`lemonade delete gemma4-it-e4b-FLM`; already decided). `gemma4e-flash-e4b-FLM` uses the same files (`Gemma4-E4B-IT-NPU2`), so it goes too.
+5. **Docs:**
+   - Rewrite the README for the new positioning: a local voice AI agent with plug-in skills, a voice-first coach and creative partner. Describe only what's built; planned skills go under a roadmap.
+   - Update the GitHub description with `gh repo edit tejb96/ai-buddy --description …`.
+   - Write `docs/ROADMAP.md` from "Roadmap direction" below.
+6. **After `scripts/update-flm.sh`** (FLM 1.0.8; the user runs it, it needs sudo), re-check:
+   - concurrent Whisper + LLM, and `--preemption`;
+   - `tool_choice`;
+   - Gemma's decode speed.
+
+**Rules the user set** (also in the session prompt):
+- **Efficiency first.** It's a laptop: use the NPU where a model can run there. CPU or GPU only for models that exist only there (Kokoro and the embeddings on the CPU). No latency benchmarks.
+- **No extra cost per turn.** Don't add tokens or LLM calls to every turn unless they clearly pay for themselves.
+- **No guessing.** Kira uses a tool or says she doesn't know, and never invents details (cities, personal stories). Unambiguous intents are enforced in code.
+- **Spoken style.** Plain sentences; details and sources go on screen.
+- **Ask before acting.** Skills that change something ask first.
+- **Built-in models only.** Use models from Lemonade's built-in registry, never custom `user.*` models.
+- **Settings.** App-level Lemonade/FLM settings are preferred; no sudo without asking; record every change here.
+- **Commit as you go.** If the context gets long, write a handoff and stop.
+
+## Roadmap direction (from the user; now [ROADMAP.md](ROADMAP.md))
 
 Kira is a local voice AI agent with plug-in skills: a voice-first coach and creative partner.
 

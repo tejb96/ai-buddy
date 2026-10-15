@@ -36,7 +36,7 @@ from .knowledge import KnowledgeBase, keywords
 from .lemonade import Lemonade, LemonadeError
 from .metrics import Answer, compute_metrics, words
 from .models import ModelManager
-from .prompts import CHAT_KICKOFF, NUDGE, Persona, chat_system_prompt, notes_block
+from .prompts import CHAT_KICKOFF, CLAIM_NUDGE, NUDGE, Persona, chat_system_prompt, notes_block
 from .router import recheck, recheck_note, route, said_by_user
 from .skills import SkillSet
 from .storage import Store
@@ -49,6 +49,15 @@ MODES = ("chat", "presentation", "interview")
 # "Let me look that up." with no tool call: the model announced a lookup instead of doing it.
 _ANNOUNCE = re.compile(r"\b(let me|i'?ll|i will|one (sec|second|moment)|give me a (sec|second|moment)|hang on|"
                        r"hold on)\b[^.!?]{0,60}\b(look|check|search|find|pull|see|get)", re.I)
+# "Got it, buy bread has been added": a claim that something was done. Without a tool call that's not true (seen
+# with qwen3.5-9b in 1 of 4 runs of "please add buy bread to my to-do list").
+_CLAIMED = re.compile(r"\b(?:i'?ve|i have|i|it'?s|it has|has|have|is|are)\s+(?:now\s+|just\s+|already\s+)?(?:been\s+)?"
+                      r"(?:added|saved|created|written|wrote|deleted|removed|moved|renamed|sent|scheduled|booked|"
+                      r"updated|set up|put|noted|stored|recorded|marked)\b|\bis now (?:on|in) your\b", re.I)
+# A request to change something ("please add...", "can you create...").
+_ACTION_REQUEST = re.compile(r"^\W*(?:(?:um|uh|so|okay|ok|hey|please|can you|could you|would you|will you)\b[,\s]*)*"
+                             r"(?:add|put|save|create|make|write|delete|remove|move|rename|send|schedule|book|remind|"
+                             r"set|update|edit|change|mark|note|append|clear)\b", re.I)
 _NO = re.compile(r"\b(no|nope|nah|don'?t|do not|stop|cancel|never ?mind|wait|hold on|not now|not yet)\b", re.I)
 _YES = re.compile(r"^\W*(?:(?:um|uh|ok|okay|so|yeah)\W+)*(?:yes|yeah|yep|yup|sure|go ahead|do it|please do|okay|ok|"
                   r"sounds good|absolutely|of course|correct|confirm(?:ed)?|alright|all right|definitely|why not)\b",
@@ -103,6 +112,7 @@ class Round:
     raw: str = ""
     text: str = ""
     calls: list[dict] = field(default_factory=list)
+    false_claim: bool = False        # said it did something without calling a tool (held back, never shown)
 
 
 class LiveTranscript:
@@ -513,7 +523,7 @@ class Session:
             routed = route(text, self.svc.tools, self.svc.tool_ctx)
             if not routed and (routed := recheck(text, self.history[:-1], self.svc.tools)):
                 claim = text      # the user questioned an answer from tools: check again, compare honestly
-        await self._reply(t_end, tools=self.mode == "chat", routed=routed, claim=claim)
+        await self._reply(t_end, tools=self.mode == "chat", routed=routed, claim=claim, request=text)
 
     async def _transcript(self, pcm: bytes, live: LiveTranscript | None) -> str:
         text = await live.finish() if live else None
@@ -541,7 +551,7 @@ class Session:
     # ---------- the assistant's reply ----------
 
     async def _reply(self, t_ref: float, tools: bool = True, routed: list[ToolCall] = (),
-                     claim: str | None = None) -> None:
+                     claim: str | None = None, request: str = "") -> None:
         """Stream the assistant's reply and speak it clause by clause while it is still being written. If the model
         calls tools, say a short filler line, run them, and let the model continue with the results."""
         self.reply_id += 1
@@ -565,7 +575,8 @@ class Session:
         speaker_task = asyncio.create_task(speaker())
         interrupted, final = True, ""
         try:
-            final = await self._agent_loop(rid, pieces, timing, t_ref, shown, meta, tools, list(routed), claim)
+            final = await self._agent_loop(rid, pieces, timing, t_ref, shown, meta, tools, list(routed), claim,
+                                           request)
             pieces.put_nowait(None)
             await speaker_task
             interrupted = False
@@ -589,21 +600,32 @@ class Session:
                 self._state("idle")
 
     async def _agent_loop(self, rid: int, pieces: asyncio.Queue, timing: dict, t_ref: float, shown: list[str],
-                          meta: dict, tools_on: bool, routed: list[ToolCall], claim: str | None = None) -> str:
+                          meta: dict, tools_on: bool, routed: list[ToolCall], claim: str | None = None,
+                          request: str = "") -> str:
         """LLM rounds until the model answers without calling a tool. Returns the final answer text
         (already appended to the history). `claim`: what the user said when questioning an answer, if the routed
-        calls re-check it."""
+        calls re-check it. `request`: what the user said; when it asks for a change and a tool that changes things
+        is on, each round is held back until it's complete, so "it's done" without a tool call is never heard."""
         cap = self.cfg.tools.max_calls_per_turn
         registry = self.svc.tools
         schemas = self._tool_schemas() if tools_on else None
         used, nudged, over_cap_rounds = 0, False, 0
+        hold = bool(schemas and _ACTION_REQUEST.search(request) and any(t.confirm for t in registry.tools.values()))
         if routed and schemas:
             # The words were known first and clearly need these tools: make the calls before the model runs,
             # so it answers from the results in one round.
             used += len(routed)
             await self._tool_round(rid, routed, "", "", pieces, meta, timing, t_ref, shown, claim)
         for _ in range(cap + 3):
-            rnd = await self._llm_round(rid, pieces, timing, t_ref, shown, schemas)
+            rnd = await self._llm_round(rid, pieces, timing, t_ref, shown, schemas, hold and not used)
+            if rnd.false_claim:
+                if nudged:
+                    fallback = "Sorry, I couldn't do that just now. Could you ask me again?"
+                    break
+                nudged = True
+                self.history.append({"role": "assistant", "content": rnd.raw})
+                self.history.append({"role": "user", "content": CLAIM_NUDGE})
+                continue
             calls = [registry.parse(c) for c in rnd.calls] if schemas else []
             if calls:
                 if used >= cap:
@@ -660,13 +682,22 @@ class Session:
             self.history.append(registry.results_message(calls, results, recheck_note(claim, results)))
 
     async def _llm_round(self, rid: int, pieces: asyncio.Queue, timing: dict, t_ref: float, shown: list[str],
-                         schemas: list[dict] | None) -> Round:
-        """One streamed LLM request, shown and spoken as it's written."""
+                         schemas: list[dict] | None, hold: bool = False) -> Round:
+        """One streamed LLM request, shown and spoken as it's written. With `hold`, nothing is shown or spoken until
+        the round is complete; a round that claims something was done without calling a tool is dropped
+        (`false_claim`)."""
         chunker = SpeechChunker()
         rnd = Round()
         raw: list[str] = []
         content: list[str] = []
+        held: list[str] = []
         gap = bool("".join(shown).strip())   # separate this round's text from the previous round's
+
+        def release(delta: str) -> None:
+            content.append(delta)
+            self.send({"type": "reply_delta", "id": rid, "text": delta})
+            for piece in chunker.feed(delta):
+                pieces.put_nowait(piece)
 
         stream = self.models.llm_events(self.history, tools=schemas, think=False, temperature=self.cfg.chat.temperature,
                                         max_tokens=self.cfg.chat.max_tokens)
@@ -683,14 +714,20 @@ class Session:
                         continue
                     if "llm_first_token_ms" not in timing:
                         timing["llm_first_token_ms"] = round((time.perf_counter() - t_ref) * 1000)
-                    if gap and not content:
+                    if gap and not content and not held:
                         delta = " " + delta.lstrip()
-                    content.append(delta)
-                    self.send({"type": "reply_delta", "id": rid, "text": delta})
-                    for piece in chunker.feed(delta):
-                        pieces.put_nowait(piece)
+                    if hold:
+                        held.append(delta)
+                    else:
+                        release(delta)
         finally:
             await stream.aclose()       # releases the NPU (FLM stops when the client disconnects)
+        if held:
+            if not rnd.calls and _CLAIMED.search("".join(held)):
+                rnd.false_claim = True
+                rnd.raw = "".join(raw)
+                return rnd
+            release("".join(held))
         for piece in chunker.flush():
             pieces.put_nowait(piece)
         rnd.raw = "".join(raw)

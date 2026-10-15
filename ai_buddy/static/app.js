@@ -1188,7 +1188,7 @@ const settingsUI = {
   },
   bind() {
     $("open-settings").addEventListener("click", () => this.open());
-    $("close-settings").addEventListener("click", () => $("settings").close());
+    $("close-settings").addEventListener("click", () => { this.stopSample(); $("settings").close(); });
     $("settings").addEventListener("click", (e) => { if (e.target === $("settings")) $("settings").close(); });
     $("settings").addEventListener("close", () => this.stopSample());
     $("set-voice").addEventListener("change", (e) => {

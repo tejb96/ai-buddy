@@ -9,6 +9,9 @@ cd scripts/bench
 ```
 
 Synthesized speech (Kokoro) is cached in `audio_cache/`, JSON results go to `results/`; both are git-ignored.
+Since session 4 the app always sends Whisper's text to the LLM (`audio_llm.py whisper:<llm>` matches it); the
+`audio:` and `heard:` pipelines and the Gemma scripts stay for comparison, with their old prompts in `common.py`.
+The test prompts call the assistant Kira, so the scripts keep that name in the system prompt.
 Keep runs short and spaced out: long back-to-back loops heat the laptop up. Never send Whisper and LLM
 requests at the same time (FLM 1.0.6 corrupts both results).
 

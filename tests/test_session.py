@@ -6,7 +6,7 @@ import asyncio
 
 import pytest
 
-from ai_buddy.prompts import NUDGE
+from ai_buddy.prompts import CLAIM_NUDGE, NUDGE
 from ai_buddy.session import yes_or_no
 from ai_buddy.tools import RECHECK_SUFFIX, RESULTS_PREFIX
 from fakes import FakeSearch, SaveNote, call, events, make_session, say, speech
@@ -160,6 +160,29 @@ async def test_actions_ask_first(tmp_path, allow):
 async def _start_then_turn(s):
     await s._start("chat", None, "")
     await s._user_turn(speech(), None)
+
+
+async def test_saying_its_done_without_calling_the_tool_is_never_heard(tmp_path):
+    """"Got it, buy bread has been added" with no tool call is held back and dropped; the model is told nothing
+    happened, calls the tool, and the app asks first as usual."""
+    note = SaveNote()
+    s, lm, _ = make_session(tmp_path, [say("Got it! Buy bread has been added to your notes."),
+                                       [call("save_note", text="buy bread")], say("Done, it's saved.")],
+                            ["Please add buy bread to my notes."], extra_tools=[note])
+    await s._start("chat", None, "")
+    await asyncio.gather(s._user_turn(speech(), None), answer_when_asked(s, True))
+    shown = "".join(e["text"] for e in events(s, "reply_delta"))
+    assert "has been added" not in shown and not any("added" in t for t in lm.spoken)
+    assert lm.requests[1]["messages"][-1] == {"role": "user", "content": CLAIM_NUDGE}
+    assert note.saved == ["buy bread"] and events(s, "reply_end")[-1]["text"].endswith("Done, it's saved.")
+
+
+async def test_only_requests_for_a_change_are_held_back(tmp_path):
+    s, lm, _ = make_session(tmp_path, [say("Why did the cat sit on the computer? To watch the mouse.")],
+                            ["Tell me a joke."], extra_tools=[SaveNote()])
+    await s._start("chat", None, "")
+    await s._user_turn(speech(), None)
+    assert len(events(s, "reply_delta")) > 5          # streamed word by word, not held
 
 
 async def test_a_spoken_yes_answers_the_question(tmp_path):
