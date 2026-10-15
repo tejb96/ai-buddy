@@ -110,8 +110,7 @@ class ModelManager:
                     continue
                 self._set(role, "loading")
                 try:
-                    await self.lm.load(self.names[role], self.cfg.models.llm_ctx_size if role == "llm" else None,
-                                       **self._options(role))
+                    await self.lm.load(self.names[role], self._ctx_size(role), **self._options(role))
                 except LemonadeError as e:
                     self.error = str(e)
                     self._set(role, "error")
@@ -119,6 +118,11 @@ class ModelManager:
                 self.error = None
                 self.state[role] = "ready"
                 loaded = await self.refresh()
+
+    def _ctx_size(self, role: str) -> int | None:
+        """Context to load with: the LLM's from config; the embedding model's small (Lemonade's 64k default made
+        the 0.6B embedding model take 7.7 GB of RAM; a batch of 16 note chunks needs ~5k tokens)."""
+        return {"llm": self.cfg.models.llm_ctx_size, "embed": self.cfg.models.embed_ctx_size}.get(role)
 
     def _options(self, role: str) -> dict:
         m = self.cfg.models

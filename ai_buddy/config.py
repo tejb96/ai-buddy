@@ -30,6 +30,7 @@ class ModelsCfg:
     embed: str = ""
     embed_backend: str = "cpu"          # llama.cpp backend for the embedding model
     embed_threads: int = 4              # CPU threads for it (leaves cores for Kokoro)
+    embed_ctx_size: int = 8192          # its context (Lemonade's 64k default costs ~7 GB of RAM)
     # LLMs offered in the settings panel.
     llm_choices: list[str] = field(default_factory=lambda: ["qwen3.5-9b-FLM", "gemma4-it-12b-FLM",
                                                             "qwen3.6-moe-35b-a3b-FLM"])

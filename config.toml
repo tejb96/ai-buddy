@@ -20,12 +20,11 @@ llm_choices = ["qwen3.5-9b-FLM", "gemma4-it-12b-FLM", "qwen3.6-moe-35b-a3b-FLM"]
 stt_choices = ["whisper-v3-turbo-FLM", "Whisper-Large-v3-Turbo"]
 stt_backend = "cpu"
 # Embedding model for note search, run by llama.cpp on the CPU; search then combines meaning and keywords.
-# "" = keywords only. Changing it re-embeds the notes. NOT SET UP YET (see docs/phase0-findings.md, "Start
-# here"): first `lemonade backends install llamacpp:cpu` and `lemonade pull Qwen3-Embedding-0.6B-GGUF`,
-# check that it loads on the CPU, then set embed = "Qwen3-Embedding-0.6B-GGUF".
-embed = ""
+# "" = keywords only. Changing it re-embeds the notes. Needs `lemonade backends install llamacpp:cpu`.
+embed = "Qwen3-Embedding-0.6B-GGUF"
 embed_backend = "cpu"
 embed_threads = 4                       # leaves CPU cores free for Kokoro
+embed_ctx_size = 8192                   # Lemonade's 64k default would take ~7 GB of RAM
 
 [chat]
 temperature = 0.6
