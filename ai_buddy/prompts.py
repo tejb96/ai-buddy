@@ -29,11 +29,12 @@ SPOKEN_RULES = """Everything you say is read aloud by a text-to-speech voice, so
 # How the user's words reach the model (Whisper's transcript).
 HEARING = "The user's words come from speech recognition and may contain small errors; infer what they meant."
 
-GROUNDING = """Never guess facts. If you don't know something and no tool can tell you, say you don't know. Don't assume details the user didn't give you, such as which city or which day: ask. You have no life outside these conversations, so never make up personal experiences, memories, plans or shared history; opinions of your own are fine."""
+GROUNDING = """Never guess facts. If you don't know something and no tool can tell you, say you don't know. Don't assume details the user didn't give you, such as which city or which day: ask. You have no life outside these conversations, so never make up personal experiences, memories, plans or shared history; opinions of your own are fine.
+If the user corrects or questions something you said, don't just agree and don't make up an explanation: check again with a tool if one can tell, and if the sources still disagree, say so and give both."""
 
 TOOLS_INTRO = "You have tools. Use them when they help, and answer directly when they don't:"
 TOOLS_AFTER = """When you need a tool, call it right away without announcing it; the app tells the user you're checking.
-After a tool, answer in one to three spoken sentences with the key facts. If the results don't answer the question, say so instead of guessing. Never invent facts, numbers, names or quotes."""
+After a tool, answer in one to three spoken sentences with the key facts. For live data such as weather, scores and prices, go by the most recent source. If the results don't contain the answer, say plainly that you couldn't find it. Never invent facts, numbers, names or quotes."""
 
 
 def today_line(tz_name: str, now: datetime | None = None) -> str:

@@ -37,11 +37,11 @@ from .lemonade import Lemonade, LemonadeError
 from .metrics import Answer, compute_metrics, words
 from .models import ModelManager
 from .prompts import CHAT_KICKOFF, NUDGE, Persona, chat_system_prompt, notes_block
-from .router import route
+from .router import recheck, recheck_note, route, said_by_user
 from .skills import SkillSet
 from .storage import Store
 from .text import SpeechChunker, clean_for_speech, strip_emoji
-from .tools import RESULTS_PREFIX, ToolCall, ToolContext, ToolRegistry, ToolResult
+from .tools import ToolCall, ToolContext, ToolRegistry, ToolResult
 
 log = logging.getLogger(__name__)
 
@@ -507,8 +507,12 @@ class Session:
         self.timeline_s += audio_s
         self.history.append({"role": "user", "content": text})
         self._trim_history()
-        routed = route(text, self.svc.tools, self.svc.tool_ctx) if self.mode == "chat" and self._tool_schemas() else []
-        await self._reply(t_end, tools=self.mode == "chat", routed=routed)
+        routed, claim = [], None
+        if self.mode == "chat" and self._tool_schemas():
+            routed = route(text, self.svc.tools, self.svc.tool_ctx)
+            if not routed and (routed := recheck(text, self.history[:-1], self.svc.tools)):
+                claim = text      # the user questioned an answer from tools: check again, compare honestly
+        await self._reply(t_end, tools=self.mode == "chat", routed=routed, claim=claim)
 
     async def _transcript(self, pcm: bytes, live: LiveTranscript | None) -> str:
         text = await live.finish() if live else None
@@ -526,21 +530,17 @@ class Session:
         while size() > budget * 2 // 3 and len(self.history) > self.history_prefix + 2:
             # Remove one whole exchange: something the user said and everything up to the next thing they said.
             end = self.history_prefix + 1
-            while end < len(self.history) and not self._said_by_user(self.history[end]):
+            while end < len(self.history) and not said_by_user(self.history[end]):
                 end += 1
             del self.history[self.history_prefix:end]
-
-    @staticmethod
-    def _said_by_user(msg: dict) -> bool:
-        content = str(msg.get("content") or "")
-        return msg["role"] == "user" and not content.startswith(RESULTS_PREFIX) and content != NUDGE
 
     def _tool_schemas(self) -> list[dict] | None:
         return self.svc.tools.schemas() if self.mode == "chat" and self.svc.tools else None
 
     # ---------- the assistant's reply ----------
 
-    async def _reply(self, t_ref: float, tools: bool = True, routed: list[ToolCall] = ()) -> None:
+    async def _reply(self, t_ref: float, tools: bool = True, routed: list[ToolCall] = (),
+                     claim: str | None = None) -> None:
         """Stream the assistant's reply and speak it clause by clause while it is still being written. If the model
         calls tools, say a short filler line, run them, and let the model continue with the results."""
         self.reply_id += 1
@@ -564,7 +564,7 @@ class Session:
         speaker_task = asyncio.create_task(speaker())
         interrupted, final = True, ""
         try:
-            final = await self._agent_loop(rid, pieces, timing, t_ref, shown, meta, tools, list(routed))
+            final = await self._agent_loop(rid, pieces, timing, t_ref, shown, meta, tools, list(routed), claim)
             pieces.put_nowait(None)
             await speaker_task
             interrupted = False
@@ -588,9 +588,10 @@ class Session:
                 self._state("idle")
 
     async def _agent_loop(self, rid: int, pieces: asyncio.Queue, timing: dict, t_ref: float, shown: list[str],
-                          meta: dict, tools_on: bool, routed: list[ToolCall]) -> str:
+                          meta: dict, tools_on: bool, routed: list[ToolCall], claim: str | None = None) -> str:
         """LLM rounds until the model answers without calling a tool. Returns the final answer text
-        (already appended to the history)."""
+        (already appended to the history). `claim`: what the user said when questioning an answer, if the routed
+        calls re-check it."""
         cap = self.cfg.tools.max_calls_per_turn
         registry = self.svc.tools
         schemas = self._tool_schemas() if tools_on else None
@@ -599,7 +600,7 @@ class Session:
             # The words were known first and clearly need these tools: make the calls before the model runs,
             # so it answers from the results in one round.
             used += len(routed)
-            await self._tool_round(rid, routed, "", "", pieces, meta, timing, t_ref)
+            await self._tool_round(rid, routed, "", "", pieces, meta, timing, t_ref, claim)
         for _ in range(cap + 3):
             rnd = await self._llm_round(rid, pieces, timing, t_ref, shown, schemas)
             calls = [registry.parse(c) for c in rnd.calls] if schemas else []
@@ -642,7 +643,7 @@ class Session:
         return fallback
 
     async def _tool_round(self, rid: int, calls: list[ToolCall], raw: str, text: str, pieces: asyncio.Queue,
-                          meta: dict, timing: dict, t_ref: float) -> None:
+                          meta: dict, timing: dict, t_ref: float, claim: str | None = None) -> None:
         """Run a round of tool calls and add them and their results to the history."""
         registry = self.svc.tools
         if not text.strip():
@@ -652,7 +653,10 @@ class Session:
         results = await self._run_tools(rid, calls, meta, timing, t_ref, pieces)
         self._state("thinking")
         self.history.append({"role": "assistant", "content": raw, "tool_calls": [c.for_history() for c in calls]})
-        self.history.append(registry.results_message(calls, results))
+        if claim is None:
+            self.history.append(registry.results_message(calls, results))
+        else:
+            self.history.append(registry.results_message(calls, results, recheck_note(claim, results)))
 
     async def _llm_round(self, rid: int, pieces: asyncio.Queue, timing: dict, t_ref: float, shown: list[str],
                          schemas: list[dict] | None) -> Round:

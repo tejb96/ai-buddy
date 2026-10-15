@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date
 
 import pytest
 
 from ai_buddy.config import load_config
-from ai_buddy.router import route
+from ai_buddy.router import figures, questions_a_fact, recheck, recheck_note, route
 from ai_buddy.skills import SkillSet, discover
-from ai_buddy.tools import ToolCall, ToolContext
+from ai_buddy.tools import RECHECK_SUFFIX, RESULTS_PREFIX, Tool, ToolCall, ToolContext, ToolRegistry, ToolResult
 
 REG = SkillSet(discover(), ["web-search", "notes", "clock", "calculator"]).registry()
 
@@ -77,3 +78,67 @@ def test_notes_need_a_knowledge_base():
 def test_routes_only_use_enabled_tools():
     reg = SkillSet(discover(), ["web-search"]).registry()
     assert route("What time is it in Tokyo?", reg, CTX) == []
+
+
+@pytest.mark.parametrize("text,questioned", [
+    ("Isn't it 16 degrees and feels like 12?", True),
+    ("Are you sure?", True),
+    ("Hmm, that doesn't sound right.", True),
+    ("My weather app says 16.", True),
+    ("I thought it was half past three.", True),
+    ("Can you double-check that?", True),
+    ("Isn't it lovely out there?", False),       # no figure, no doubt: just chat
+    ("I thought so too!", False),
+    ("Thanks, that's helpful.", False),
+])
+def test_questions_a_fact(text, questioned):
+    assert questions_a_fact(text) is questioned
+
+
+def _turn(*calls):
+    return {"role": "assistant", "content": "", "tool_calls": [ToolCall(f"c{i}", n, a, json.dumps(a)).for_history()
+                                                                for i, (n, a) in enumerate(calls)]}
+
+
+def test_recheck_repeats_the_last_exchanges_read_only_calls():
+    reg = SkillSet(discover(), ["web-search", "clock"]).registry()
+    history = [{"role": "system", "content": "..."},
+               {"role": "user", "content": "What's the weather in Calgary right now?"},
+               _turn(("web_search", {"query": "Calgary weather now"})),
+               {"role": "user", "content": RESULTS_PREFIX + " ..."},
+               {"role": "assistant", "content": "It's nine degrees and cloudy."}]
+    calls = recheck("Isn't it 16 degrees and feels like 12?", history, reg)
+    assert [(c.name, c.args) for c in calls] == [("web_search", {"query": "Calgary weather now", "double_check": True})]
+    assert calls[0].routed
+    assert recheck("Thanks!", history, reg) == []
+    earlier = history + [{"role": "user", "content": "Tell me a joke."}, {"role": "assistant", "content": "Ha."}]
+    assert recheck("Are you sure?", earlier, reg) == []          # the last answer didn't come from a tool
+
+
+def test_recheck_never_repeats_a_tool_that_changes_something():
+    class Save(Tool):
+        name, description, confirm = "save_note", "Save a note.", True
+        parameters, required = {"text": {"type": "string"}}, ["text"]
+    reg = ToolRegistry([SkillSet(discover(), ["clock"]).registry().tools["get_datetime"], Save()])
+    history = [{"role": "user", "content": "Save 'buy milk' and tell me the time."},
+               _turn(("save_note", {"text": "buy milk"}), ("get_datetime", {})),
+               {"role": "user", "content": RESULTS_PREFIX + " ..."},
+               {"role": "assistant", "content": "Saved, and it's 3 PM."}]
+    assert [c.name for c in recheck("Are you sure?", history, reg)] == ["get_datetime"]
+
+
+def test_figures():
+    assert figures("Isn't it 16 degrees and feels like 12?") == ["16", "12"]
+    assert figures("I thought it was sixteen, or twenty-one at 3:30") == ["16", "21", "3:30"]
+    assert figures("about 1,200 people, 4.5 stars") == ["1200", "4.5"]
+
+
+def test_recheck_note_names_the_users_figures_the_results_lack():
+    results = [ToolResult({"results": [{"title": "Environment Canada", "text": "13°C · Observed 6:00 PM · High 12."}]})]
+    note = recheck_note("Isn't it 16 degrees and feels like 12?", results)
+    assert note.startswith(RECHECK_SUFFIX)
+    assert "The user's figure 16 is not in any of these results: don't say a source shows it." in note
+    assert recheck_note("Isn't it 13?", results) == RECHECK_SUFFIX
+    dates = [ToolResult({"text": "Fri Oct 16 · Feels 3 · 12am · Feels -2 · 16 October: sunny"})]
+    assert "figures 16, 12 are not in" in recheck_note("Isn't it 16 and feels like 12?", dates)
+    assert "figures 45, 7" in recheck_note("Isn't it 45, or 7?", [ToolResult({"result": 43.2})])

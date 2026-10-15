@@ -1,4 +1,5 @@
-"""Web helpers shared by the search and page tools: search backends, page fetching, text extraction.
+"""Web helpers shared by the search and page tools: search backends, page fetching, text extraction, and how
+current a page is (its "as of" time, for live data such as weather and scores).
 
 No API keys: DuckDuckGo's HTML endpoint by default, or a self-hosted SearXNG instance.
 """
@@ -8,7 +9,9 @@ from __future__ import annotations
 import asyncio
 import html
 import re
-from datetime import date, timedelta
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -133,8 +136,15 @@ _BLOCK = {"p", "div", "section", "article", "main", "li", "ul", "ol", "tr", "tab
 _VOID = {"br", "hr", "img", "input", "meta", "link", "area", "base", "col", "embed", "source", "track", "wbr"}
 
 
+# Meta tags (name, property or itemprop) that say when a page was updated or published.
+_TIME_META = {"article:modified_time", "og:updated_time", "article:published_time", "datemodified", "datepublished",
+              "date", "dc.date", "dcterms.modified", "last-modified", "pubdate", "publishdate"}
+
+
 class _TextExtractor(HTMLParser):
-    """Visible text with line breaks at block boundaries; navigation, scripts and forms are dropped."""
+    """Visible text with line breaks at block boundaries; navigation, scripts and forms are dropped. Also collects
+    the page's update/publish times: `times` from its meta tags and its first JSON-LD block (the page itself),
+    `time_tags` from <time datetime> (often other items: related articles, comments)."""
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
@@ -142,16 +152,28 @@ class _TextExtractor(HTMLParser):
         self.main_parts: list[str] = []
         self.title = ""
         self.description = ""
+        self.times: list[str] = []
+        self.time_tags: list[str] = []
+        self._ld_blocks = 0
         self._skip = 0
         self._main = 0
         self._in_title = False
+        self._ld = False
 
     def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
         if tag == "meta":
-            a = dict(attrs)
-            if (a.get("name") or a.get("property") or "").lower() in ("description", "og:description"):
+            key = (a.get("name") or a.get("property") or a.get("itemprop") or a.get("http-equiv") or "").lower()
+            if key in ("description", "og:description"):
                 self.description = self.description or (a.get("content") or "")
+            elif key in _TIME_META and a.get("content"):
+                self.times.append(a["content"])
             return
+        if tag == "time" and a.get("datetime"):
+            self.time_tags.append(a["datetime"])
+        if tag == "script" and (a.get("type") or "").lower() == "application/ld+json":
+            self._ld = True
+            self._ld_blocks += 1
         if tag == "title":
             self._in_title = True
         if tag in _VOID:
@@ -170,6 +192,8 @@ class _TextExtractor(HTMLParser):
     def handle_endtag(self, tag):
         if tag == "title":
             self._in_title = False
+        if tag == "script":
+            self._ld = False
         if tag in _VOID:
             return
         if tag in _SKIP:
@@ -180,6 +204,10 @@ class _TextExtractor(HTMLParser):
             self._emit("\n")
 
     def handle_data(self, data):
+        if self._ld:
+            if self._ld_blocks == 1:      # the first block describes the page; later ones are often other items
+                self.times += re.findall(r'"date(?:Modified|Published)"\s*:\s*"([^"]{8,40})"', data)[:2]
+            return
         if self._in_title:
             self.title += data
             return
@@ -203,8 +231,22 @@ def _clean_lines(raw: str) -> list[str]:
     return lines
 
 
-def html_to_text(page: str) -> tuple[str, str]:
-    """(title, readable text) of an HTML page. Prefers <main>/<article> when they hold real content."""
+@dataclass
+class Page:
+    title: str
+    text: str
+    as_of: datetime | None = None       # when the page says it was updated or published (local time), if it does
+    timed: bool = False                 # as_of includes a time of day, not just a date
+
+    def as_of_text(self) -> str | None:
+        if not self.as_of:
+            return None
+        return self.as_of.strftime("%a %b %-d %Y, %-I:%M %p" if self.timed else "%a %b %-d %Y")
+
+
+def parse_html(page: str, now: datetime | None = None, last_modified: str | None = None) -> Page:
+    """Title, readable text and "as of" time of an HTML page. Prefers <main>/<article> when they hold real
+    content."""
     p = _TextExtractor()
     try:
         p.feed(page)
@@ -215,7 +257,122 @@ def html_to_text(page: str) -> tuple[str, str]:
     lines = main if sum(len(x) for x in main) > 400 else _clean_lines("".join(p.parts))
     if p.description and p.description.strip() not in lines:
         lines.insert(0, p.description.strip())
-    return " ".join(html.unescape(p.title).split()), "\n".join(lines)
+    text = "\n".join(lines)
+    as_of, timed = page_time(p.times, text, last_modified, now, p.time_tags[:1]) if now else (None, False)
+    return Page(" ".join(html.unescape(p.title).split()), text, as_of, timed)
+
+
+def html_to_text(page: str) -> tuple[str, str]:
+    """(title, readable text) of an HTML page."""
+    parsed = parse_html(page)
+    return parsed.title, parsed.text
+
+
+# ---------- how current a page is ----------
+
+_MON = {m[:3]: i for i, m in enumerate("january february march april may june july august september october november "
+                                       "december".split(), 1)}
+_ISO = re.compile(r"(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::\d{2}(?:\.\d+)?)?\s*(Z|[+-]\d{2}:?\d{2})?)?")
+_DMY = re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?,?\s+(\d{4})",
+                  re.I)
+_MDY = re.compile(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})",
+                  re.I)
+_CLOCK = re.compile(r"\b(\d{1,2})(?::(\d{2}))?\s*([ap])\.?\s?m\b\.?|\b([01]?\d|2[0-3]):([0-5]\d)\b", re.I)
+_AGO = re.compile(r"\b(\d+|an?|one)\s+(min(?:ute)?s?|hours?|hrs?|days?)\s+ago\b", re.I)
+# Visible stamps about the data itself: "Observed at: Calgary Int'l Airport 2:00 PM MDT Wednesday 14 October 2026",
+# "Updated: Oct 14, 2026 3:05 p.m.", "Last updated 12 minutes ago", "As of 2:15 pm".
+_STAMP = re.compile(r"\b(?:observed at|last updated|updated|as of|published|posted)\b[:\s]+(?P<when>[^\n|]{3,90})", re.I)
+
+
+def _clock(s: str) -> tuple[int, int] | None:
+    m = _CLOCK.search(s)
+    if not m:
+        return None
+    if m.group(3):
+        hour = int(m.group(1)) % 12 + (12 if m.group(3).lower() == "p" else 0)
+        return (hour, int(m.group(2) or 0)) if int(m.group(1)) <= 12 else None
+    return int(m.group(4)), int(m.group(5))
+
+
+def parse_when(s: str, now: datetime) -> tuple[datetime, bool] | None:
+    """A date (and time) in `s`, as naive local time like `now`'s: ISO 8601, "14 October 2026",
+    "Oct 14, 2026 3:05 PM", "12 minutes ago", or a bare time of day (today). Returns (when, has_time)."""
+    local = now.replace(tzinfo=None)
+    if m := _ISO.search(s):
+        y, mo, d, hh, mm, tz = m.groups()
+        try:
+            when = datetime(int(y), int(mo), int(d), int(hh or 0), int(mm or 0))
+        except ValueError:
+            return None
+        if tz and now.tzinfo:
+            offset = timezone.utc if tz == "Z" else timezone(timedelta(hours=int(tz[:3]), minutes=int(tz[-2:]) *
+                                                                      (1 if tz[0] == "+" else -1)))
+            when = when.replace(tzinfo=offset).astimezone(now.tzinfo).replace(tzinfo=None)
+        elif hh is not None and now.tzinfo and when > local + timedelta(hours=1):
+            # A time without a zone that lies ahead of us is usually UTC.
+            utc = when.replace(tzinfo=timezone.utc).astimezone(now.tzinfo).replace(tzinfo=None)
+            if utc <= local + timedelta(hours=1):
+                when = utc
+        return when, hh is not None
+    if (m := _DMY.search(s)) or (m := _MDY.search(s)):
+        g = m.groups()
+        day, mon, year = (g[0], g[1], g[2]) if m.re is _DMY else (g[1], g[0], g[2])
+        try:
+            when = datetime(int(year), _MON[mon[:3].lower()], int(day))
+        except (ValueError, KeyError):
+            return None
+        hm = _clock(s)
+        return (when.replace(hour=hm[0], minute=hm[1]), True) if hm else (when, False)
+    if m := _AGO.search(s):
+        n = 1 if m.group(1).lower() in ("a", "an", "one") else int(m.group(1))
+        unit = m.group(2).lower()
+        delta = timedelta(minutes=n) if unit.startswith("min") else timedelta(hours=n) if unit.startswith("h") \
+            else timedelta(days=n)
+        return local - delta, not unit.startswith("d")
+    if hm := _clock(s):
+        day = local.date() - timedelta(days=1) if re.search(r"\byesterday\b", s, re.I) else local.date()
+        when = datetime(day.year, day.month, day.day, *hm)
+        return (when, True) if when <= local + timedelta(hours=1) else None
+    return None
+
+
+def page_time(meta_times: list[str], text: str, last_modified: str | None, now: datetime,
+              time_tags: list[str] = ()) -> tuple[datetime | None, bool]:
+    """When a page's information dates from, trying in turn: its own metadata (meta tags, its first JSON-LD
+    block), its visible stamps ("Observed at 6:00 PM", "Updated a minute ago"), its first <time> tag, and the
+    Last-Modified header (a dynamic page's is just when it was built). The latest of the first kind found that
+    isn't in the future; (None, False) when the page doesn't say."""
+    limit = now.replace(tzinfo=None) + timedelta(hours=2)
+
+    def latest(found: list[tuple[datetime, bool]]) -> tuple[datetime, bool] | None:
+        found = [w for w in found if w and datetime(2000, 1, 1) < w[0] <= limit]
+        return max(found, key=lambda w: w[0]) if found else None
+
+    if w := latest([parse_when(t, now) for t in meta_times]):
+        return w
+    if w := latest([parse_when(m["when"], now) for m in _STAMP.finditer(text[:20000])]):
+        return w
+    if w := latest([parse_when(t, now) for t in time_tags]):
+        return w
+    if last_modified:
+        try:
+            lm = parsedate_to_datetime(last_modified)
+            lm = lm.astimezone(now.tzinfo).replace(tzinfo=None) if now.tzinfo else lm.replace(tzinfo=None)
+            if w := latest([(lm, True)]):
+                return w
+        except (TypeError, ValueError):
+            pass
+    return None, False
+
+
+# Questions about things that change by the hour or day: the newest source wins.
+_LIVE = re.compile(r"\b(weather|forecast|temperature|rain|snow|wind|storm|score|scores|game|match|playoffs?|standings|"
+                   r"won|wins|results?|stock|stocks|price|prices|exchange rate|rates?|traffic|news|latest|live|now|"
+                   r"today|tonight|currently|current|this (?:week|morning|afternoon|evening))\b", re.I)
+
+
+def is_live(query: str) -> bool:
+    return bool(_LIVE.search(query))
 
 
 _DAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
@@ -279,8 +436,9 @@ def relevant_passages(text: str, query: str, max_chars: int, today: date | None 
     return "\n".join(b for _, b in sorted(picked))
 
 
-async def fetch_page(http: httpx.AsyncClient, url: str, timeout: float) -> tuple[str, str]:
-    """(title, text) of a web page. Raises on non-HTML/text content, errors and oversized pages."""
+async def fetch_page(http: httpx.AsyncClient, url: str, timeout: float, now: datetime | None = None) -> Page:
+    """A web page's title, text and "as of" time (with `now`). Raises on non-HTML/text content, errors and
+    oversized pages."""
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         raise ValueError(f"not a web address: {url}")
@@ -296,24 +454,35 @@ async def fetch_page(http: httpx.AsyncClient, url: str, timeout: float) -> tuple
             if len(body) > MAX_PAGE_BYTES:
                 break
         encoding = r.encoding or "utf-8"
+        last_modified = r.headers.get("last-modified")
     text = bytes(body).decode(encoding, errors="replace")
     if "html" in ctype or text.lstrip()[:200].lower().startswith(("<!doctype", "<html")):
-        return html_to_text(text)
-    return "", "\n".join(_clean_lines(text))
+        return parse_html(text, now, last_modified)
+    plain = "\n".join(_clean_lines(text))
+    as_of, timed = page_time([], plain, last_modified, now) if now else (None, False)
+    return Page("", plain, as_of, timed)
 
 
 async def read_pages(http: httpx.AsyncClient, results: list[dict], query: str, *, pages: int, chars: int,
-                     timeout: float, today: date | None = None) -> list[dict]:
-    """Fetch a few of the top results concurrently and attach the passages relevant to the query."""
-    candidates = results[: pages + 1]
+                     timeout: float, today: date | None = None, now: datetime | None = None) -> list[dict]:
+    """Fetch a few of the top results concurrently and attach the passages relevant to the query, and each page's
+    "as of" time. For live data (weather, scores, prices...) one more page is tried and the newest come first."""
+    live = is_live(query)
+    candidates = results[: pages + 1 + live]
 
     async def one(res: dict) -> dict | None:
         try:
-            title, text = await fetch_page(http, res["url"], timeout)
+            page = await fetch_page(http, res["url"], timeout, now)
         except (httpx.HTTPError, ValueError, UnicodeError):
             return None
-        passages = relevant_passages(text, query, chars, today)
-        return {**res, "title": res.get("title") or title, "text": passages} if len(passages) > 80 else None
+        passages = relevant_passages(page.text, query, chars, today)
+        if len(passages) <= 80:
+            return None
+        return {**res, "title": res.get("title") or page.title, "text": passages, "as_of": page.as_of,
+                "as_of_text": page.as_of_text()}
 
-    read = await asyncio.gather(*(one(r) for r in candidates))
-    return [r for r in read if r][:pages]
+    read = [r for r in await asyncio.gather(*(one(r) for r in candidates)) if r]
+    if live:
+        # Pages that say when they were updated, newest first; the others after them, in search order.
+        read.sort(key=lambda r: (r["as_of"] is None, -r["as_of"].timestamp() if r["as_of"] else 0))
+    return read[:pages]

@@ -119,7 +119,7 @@ _REAL_SEARCH = next(t for t in discover()["web-search"].tools if t.name == "web_
 
 
 class FakeSearch(Tool):
-    """web_search without the web (it routes like the real one)."""
+    """web_search without the web (it routes and re-checks like the real one)."""
     name = "web_search"
     description = "Search the web."
     parameters = {"query": {"type": "string"}}
@@ -137,6 +137,9 @@ class FakeSearch(Tool):
 
     def route(self, text, ctx):
         return _REAL_SEARCH.route(text, ctx)
+
+    def recheck(self, args):
+        return _REAL_SEARCH.recheck(args)
 
 
 class SaveNote(Tool):

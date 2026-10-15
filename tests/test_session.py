@@ -8,7 +8,7 @@ import pytest
 
 from ai_buddy.prompts import NUDGE
 from ai_buddy.session import yes_or_no
-from ai_buddy.tools import RESULTS_PREFIX
+from ai_buddy.tools import RECHECK_SUFFIX, RESULTS_PREFIX
 from fakes import FakeSearch, SaveNote, call, events, make_session, say, speech
 
 
@@ -90,6 +90,40 @@ async def test_the_model_reads_whispers_words_and_whisper_never_overlaps_it(tmp_
     assert "speech recognition" in s.history[0]["content"]
     turns = s.store.get_session(s.session_id)["turns"]
     assert [t["text"] for t in turns] == ["Tell me a joke.", "Ha, good one.", "Another?", "Sure."]
+
+
+# ---------- questioning a fact ----------
+
+async def test_questioning_a_fact_from_the_web_checks_again(tmp_path):
+    """"Isn't it 16 degrees?" after a weather answer: the app searches again (reading one more source) before the
+    model answers, and asks it to compare honestly instead of just agreeing."""
+    search = FakeSearch()
+    s, lm, _ = make_session(tmp_path, [[call("web_search", query="Calgary weather now")],
+                                       say("It's nine degrees and cloudy in Calgary."),
+                                       say("You're right: a newer reading says sixteen, feeling like twelve.")],
+                            ["What's it like outside in Calgary?", "Isn't it 16 degrees and feels like 12?"],
+                            extra_tools=[search])
+    await s._start("chat", None, "")
+    await s._user_turn(speech(), None)
+    await s._user_turn(speech(), None)
+    assert search.queries == ["Calgary weather now", "Calgary weather now"] and len(lm.requests) == 3
+    sent = lm.requests[2]["messages"]
+    assert sent[-3]["content"] == "Isn't it 16 degrees and feels like 12?"
+    again = sent[-2]["tool_calls"][0]["function"]
+    assert again["name"] == "web_search" and '"double_check": true' in again["arguments"]
+    assert sent[-1]["content"].startswith(RESULTS_PREFIX) and RECHECK_SUFFIX in sent[-1]["content"]
+    assert events(s, "tool_start")[-1]["routed"]
+
+
+async def test_chat_that_merely_sounds_like_a_question_does_not_recheck(tmp_path):
+    search = FakeSearch()
+    s, lm, _ = make_session(tmp_path, [[call("web_search", query="Calgary weather now")], say("Sunny, fourteen."),
+                                       say("It really is.")],
+                            ["What's it like outside in Calgary?", "Isn't it lovely?"], extra_tools=[search])
+    await s._start("chat", None, "")
+    await s._user_turn(speech(), None)
+    await s._user_turn(speech(), None)
+    assert search.queries == ["Calgary weather now"] and len(lm.requests) == 3
 
 
 # ---------- asking permission ----------

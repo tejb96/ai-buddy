@@ -6,3 +6,4 @@ metadata:
 ---
 - web_search for anything current or that you aren't sure of: weather, news, prices, exchange rates, sports results, people, products, opening hours, events, or anything "latest". Your own knowledge is out of date, so don't answer those from memory.
 - fetch_page to read a specific page, such as a link from your search results.
+- If the user questions something you found, search again with double_check true.
