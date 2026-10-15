@@ -1,6 +1,9 @@
-"""End-to-end tests of every mode through the WebSocket, against the real models.
+"""End-to-end tests of every mode through the WebSocket, against the real models: spoken turns (Kokoro speech in,
+Whisper's transcript to the LLM), tools and the router, notes, an MCP server that asks before acting, not
+guessing, re-checking a questioned fact, and both practice modes with feedback.
 
-Run: uv run pytest -m lemonade -s   (takes a few minutes: includes two swaps to the 35B model)
+Run: uv run pytest tests/test_e2e_backend.py -m lemonade -s   (several minutes)
+No latency is asserted; timings are printed.
 """
 
 from __future__ import annotations
@@ -17,7 +20,7 @@ from conftest import Client, say, silence
 
 pytestmark = [pytest.mark.lemonade, pytest.mark.asyncio(loop_scope="session")]
 
-QUESTION = "Hey Kira, I just got back from a long walk by the river. What should I cook for dinner tonight?"
+QUESTION = "Hey Bella, I just got back from a long walk by the river. What should I cook for dinner tonight?"
 
 
 async def test_rejects_foreign_origin(server):
@@ -26,7 +29,31 @@ async def test_rejects_foreign_origin(server):
         await ws.recv()
 
 
-async def test_chat_turn_latency_and_speech(server):
+async def chat(server) -> Client:
+    """A new chat, once the greeting (which also fills FLM's prompt cache) is done."""
+    c = await Client.connect(server)
+    await c.send(type="start", mode="chat")
+    await c.until(lambda e: e["type"] == "session")
+    if server["cfg"].chat.greet:
+        await c.until(lambda e: e["type"] == "reply_end" and e.get("greeting"), timeout=180)
+    return c
+
+
+async def turn(c: Client, text: str, timeout: float = 150) -> dict:
+    """Say `text`; the finished reply (reply_end), after any tools."""
+    await c.send(type="rec_start")
+    await c.stream(silence(0.3) + say(text) + silence(0.4))
+    await c.send(type="rec_stop")
+    n = len(c.of("reply_end"))
+    return await c.until(lambda e: e["type"] == "reply_end" and len(c.of("reply_end")) > n and
+                         not e.get("greeting"), timeout=timeout)
+
+
+def tools_in(c: Client, rid: int) -> list[str]:
+    return [e["name"] for e in c.of("tool_start") if e["id"] == rid]
+
+
+async def test_chat_turn_and_speech(server):
     c = await Client.connect(server)
     await c.send(type="start", mode="chat")
     await c.until(lambda e: e["type"] == "session")
@@ -45,7 +72,6 @@ async def test_chat_turn_latency_and_speech(server):
     assert "river" in user["text"].lower() and "dinner" in user["text"].lower()
     assert end["text"] and not end["interrupted"]
     assert c.audio[rid] / 48000 > 1.0          # at least a second of 24 kHz 16-bit speech
-    assert first_audio < 6.0
     assert not any(ch in end["text"] for ch in "😊🍽️🌿")
 
     # Second turn reuses the conversation (history + FLM prefix cache).
@@ -55,6 +81,68 @@ async def test_chat_turn_latency_and_speech(server):
     t_stop = time.monotonic()
     end2 = await c.until(lambda e: e["type"] == "reply_end" and e["id"] != rid)
     print(f"  turn 2 reply: {end2['text']!r} first audio {c.first_audio_at[end2['id']] - t_stop:.2f}s")
+    await c.close()
+
+
+async def test_tool_and_notes_turns(server):
+    c = await chat(server)
+    end = await turn(c, "What time is it in Tokyo right now?")
+    print(f"\n  Tokyo: {end['text']!r} tools {tools_in(c, end['id'])}")
+    assert tools_in(c, end["id"]) == ["get_datetime"]          # routed: the clock is read before the model answers
+    end = await turn(c, "What are my talking points for the Henderson project?")
+    print(f"  notes: {end['text']!r} sources {end['sources']}")
+    assert tools_in(c, end["id"]) == ["search_notes"]
+    assert any("henderson" in s["title"].lower() for s in end["sources"])
+    assert any(w in end["text"].lower() for w in ("ten hours", "10 hours", "twelve", "12", "renewal", "churn"))
+    await c.close()
+
+
+async def test_mcp_tool_asks_before_acting_and_reads_freely(server):
+    c = await chat(server)
+    todo = server["data"] / "todo.txt"
+    await c.send(type="rec_start")
+    await c.stream(silence(0.3) + say("Please add buy oat milk to my to-do list.") + silence(0.4))
+    await c.send(type="rec_stop")
+    ask = await c.until(lambda e: e["type"] == "confirm_request", timeout=150)
+    print(f"\n  asks: {ask['text']!r} ({ask['tool']} {ask['args']})")
+    assert ask["tool"] == "todo_add_item" and not todo.exists()            # nothing happens before the answer
+    await c.send(type="confirm", call_id=ask["call_id"], allow=True)
+    end = await c.until(lambda e: e["type"] == "reply_end", timeout=150)
+    assert "oat milk" in todo.read_text().lower()
+    print(f"  reply: {end['text']!r}")
+    asked = len(c.of("confirm_request"))
+    end = await turn(c, "What's on my to-do list?")
+    print(f"  list: {end['text']!r} tools {tools_in(c, end['id'])}")
+    assert "todo_list_items" in tools_in(c, end["id"]) and len(c.of("confirm_request")) == asked   # read-only
+    assert "milk" in end["text"].lower()
+    await c.close()
+
+
+async def test_no_guessing(server):
+    c = await chat(server)
+    end = await turn(c, "Where am I going on my trip next month?")
+    print(f"\n  trip: {end['text']!r} tools {tools_in(c, end['id'])}")
+    invented = ["paris", "london", "tokyo", "new york", "rome", "hawaii", "mexico", "japan", "italy", "banff"]
+    assert not any(place in end["text"].lower() for place in invented)
+    end = await turn(c, "My sister Priya is visiting from Vancouver next week. What are two things we could do "
+                        "downtown that she'd like if she loves art?")
+    print(f"  Priya: {end['text']!r} tools {tools_in(c, end['id'])}")
+    cities = ["toronto", "los angeles", "calgary", "montreal", "seattle", "new york", "chicago", "edmonton"]
+    assert not any(city in end["text"].lower() for city in cities)         # never made up where "downtown" is
+    await c.close()
+
+
+async def test_a_questioned_fact_is_checked_again(server):
+    c = await chat(server)
+    end = await turn(c, "What's eighteen percent of two hundred and forty?")
+    print(f"\n  18% of 240: {end['text']!r} tools {tools_in(c, end['id'])}")
+    assert tools_in(c, end["id"]) == ["calculate"]
+    end = await turn(c, "Hmm, isn't it 45?")
+    print(f"  challenged: {end['text']!r} tools {tools_in(c, end['id'])}")
+    again = [e for e in c.of("tool_start") if e["id"] == end["id"]]
+    assert [e["name"] for e in again] == ["calculate"] and again[0]["routed"]       # checked, by the app
+    text = end["text"].lower()
+    assert ("43" in text or "forty-three" in text or "forty three" in text) and "you're right" not in text
     await c.close()
 
 

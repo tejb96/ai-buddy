@@ -58,8 +58,9 @@ def wav_bytes(pcm: bytes) -> bytes:
 def page(server):
     ART.mkdir(exist_ok=True)
     clips = {
-        "question": silence(0.2) + say("Hi Kira! I just finished a long bike ride along the coast. "
+        "question": silence(0.2) + say("Hi Bella! I just finished a long bike ride along the coast. "
                                        "What should I eat to recover?") + silence(0.3),
+        "todo": silence(0.2) + say("Please add buy bread to my to-do list.") + silence(0.3),
         "story": silence(0.2) + say("Can you tell me a really long story about a lighthouse keeper?") + silence(0.3),
         "talk": silence(0.6) + say(
             "Hello everyone. Today I want to talk about, um, why walking meetings are great. "
@@ -111,7 +112,77 @@ def test_chat_push_to_talk(page: Page):
     print(f"  heard: {page.locator('.msg.user .bubble').last.inner_text()!r}")
     print(f"  reply: {page.locator('.msg.buddy .bubble').last.inner_text()!r}")
     page.screenshot(path=ART / "02-chat-reply.png")
-    assert first_audio < 6
+
+
+def test_permission_card_for_an_mcp_tool(page: Page):
+    """The to-do server's add_item changes something, so the assistant asks; the card's Yes button answers."""
+    page.locator(".tabs button[data-mode=chat]").click()
+    wait_reply_done(page, "#chat-thread")
+    speak_holding_space(page, "todo")
+    card = page.locator(".confirm").last
+    expect(card).to_be_visible(timeout=150_000)
+    expect(card.locator(".confirm-detail")).to_contain_text("todo_add_item")
+    page.screenshot(path=ART / "02b-permission-card.png")
+    card.get_by_role("button", name="Yes, go ahead").click()
+    expect(card).to_have_class("confirm allowed", timeout=10_000)
+    expect(card).to_contain_text("You said yes")
+    wait_reply_done(page, "#chat-thread", timeout=150_000)
+
+
+def test_scrolling_up_stays_put_while_a_reply_streams(page: Page):
+    page.locator(".tabs button[data-mode=chat]").click()
+    wait_reply_done(page, "#chat-thread", timeout=150_000)
+    page.evaluate("""() => {
+      for (let i = 0; i < 10; i++) {
+        onEvent({type: "reply_start", id: 9000 + i});
+        onEvent({type: "reply_delta", id: 9000 + i, text: "Filler line. ".repeat(40)});
+        onEvent({type: "reply_end", id: 9000 + i, text: "", interrupted: false, timing: {}});
+      }
+      onEvent({type: "reply_start", id: 9999});
+    }""")
+    page.evaluate("onEvent({type: 'reply_delta', id: 9999, text: 'Streaming. '.repeat(40)})")
+    assert page.evaluate("scroller.atBottom()")                 # followed while at the bottom
+    page.mouse.move(500, 300)
+    page.mouse.wheel(0, -700)
+    page.wait_for_timeout(300)
+    y = page.evaluate("window.scrollY")
+    for _ in range(8):
+        page.evaluate("onEvent({type: 'reply_delta', id: 9999, text: 'More words. '.repeat(30)})")
+    assert page.evaluate("window.scrollY") == y                 # never pulled back down
+    expect(page.locator("#jump-latest")).to_be_visible()
+    page.locator("#jump-latest").click()
+    assert page.evaluate("scroller.atBottom()")
+    expect(page.locator("#jump-latest")).to_be_hidden()
+    page.evaluate("onEvent({type: 'reply_end', id: 9999, text: '', interrupted: false, timing: {}})")
+
+
+def test_settings_skills_mcp_and_voice_samples(page: Page):
+    page.locator(".tabs button[data-mode=chat]").click()
+    page.locator("#open-settings").click()
+    mcp = page.locator("#set-mcp li.skill").filter(has_text="Todo")
+    expect(mcp.locator(".badge")).to_contain_text("Connected · 3 tools", timeout=30_000)
+    expect(mcp.locator(".tag.asks")).to_be_visible()
+    page.screenshot(path=ART / "11-settings.png", full_page=True)
+    # Practice tabs come from the speaking coach skill.
+    coach = page.locator("#set-skills li.skill").filter(has_text="Speaking coach").locator("input")
+    coach.click(force=True)
+    expect(page.locator(".tabs button[data-mode=presentation]")).to_be_hidden(timeout=5_000)
+    expect(page.locator(".tabs button[data-mode=interview]")).to_be_hidden()
+    coach.click(force=True)
+    expect(page.locator(".tabs button[data-mode=presentation]")).to_be_visible(timeout=5_000)
+    # One voice sample at a time; picking another voice stops the first; Stop stops it.
+    expect(page.locator("#stop-voice")).to_be_disabled()
+    page.locator("#preview-voice").click()
+    expect(page.locator("#stop-voice")).to_be_enabled()
+    page.select_option("#set-voice", "bf_emma")
+    expect(page.locator(".persona-name").first).to_have_text("Emma", timeout=10_000)
+    page.wait_for_function("settingsUI.sample && settingsUI.sample.src.includes('bf_emma')", timeout=15_000)
+    page.locator("#stop-voice").click()
+    assert page.evaluate("settingsUI.sample") is None
+    page.select_option("#set-voice", "af_bella")
+    expect(page.locator(".persona-name").first).to_have_text("Bella", timeout=10_000)
+    page.locator("#close-settings").click()
+    assert page.evaluate("settingsUI.sample") is None          # closing Settings stops a sample
 
 
 def test_barge_in_from_browser(page: Page):

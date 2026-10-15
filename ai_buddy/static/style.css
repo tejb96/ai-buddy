@@ -419,3 +419,5 @@ dialog.settings { width: min(640px, calc(100vw - 32px)); }
 .snippet { background: var(--surface-2); border-radius: 8px; padding: 10px 12px; font-size: 12.5px; overflow-x: auto;
   margin: 6px 0 10px; }
 .btn.small { padding: 3px 10px; font-size: 13px; }
+.confirm-args { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink-2); max-height: 9em; overflow-y: auto;
+  background: var(--surface); border-radius: 8px; padding: 6px 8px; font-family: ui-monospace, monospace; font-size: 12px; }

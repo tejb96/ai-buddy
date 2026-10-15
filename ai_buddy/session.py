@@ -600,7 +600,7 @@ class Session:
             # The words were known first and clearly need these tools: make the calls before the model runs,
             # so it answers from the results in one round.
             used += len(routed)
-            await self._tool_round(rid, routed, "", "", pieces, meta, timing, t_ref, claim)
+            await self._tool_round(rid, routed, "", "", pieces, meta, timing, t_ref, shown, claim)
         for _ in range(cap + 3):
             rnd = await self._llm_round(rid, pieces, timing, t_ref, shown, schemas)
             calls = [registry.parse(c) for c in rnd.calls] if schemas else []
@@ -619,7 +619,7 @@ class Session:
                     continue
                 calls = calls[: cap - used]
                 used += len(calls)
-                await self._tool_round(rid, calls, rnd.raw, rnd.text, pieces, meta, timing, t_ref)
+                await self._tool_round(rid, calls, rnd.raw, rnd.text, pieces, meta, timing, t_ref, shown)
                 continue
             if schemas and not nudged and used < cap and _ANNOUNCE.search(rnd.text) and len(rnd.text.split()) <= 40:
                 # It said it would look something up but didn't call a tool: what it said serves as the
@@ -643,14 +643,14 @@ class Session:
         return fallback
 
     async def _tool_round(self, rid: int, calls: list[ToolCall], raw: str, text: str, pieces: asyncio.Queue,
-                          meta: dict, timing: dict, t_ref: float, claim: str | None = None) -> None:
+                          meta: dict, timing: dict, t_ref: float, shown: list[str], claim: str | None = None) -> None:
         """Run a round of tool calls and add them and their results to the history."""
         registry = self.svc.tools
         if not text.strip():
             tool = registry.get(calls[0].name)
             pieces.put_nowait(Filler(tool.filler_line() if tool else "One moment."))
         self._state("tool", self._tool_label(calls))
-        results = await self._run_tools(rid, calls, meta, timing, t_ref, pieces)
+        results = await self._run_tools(rid, calls, meta, timing, t_ref, pieces, shown)
         self._state("thinking")
         self.history.append({"role": "assistant", "content": raw, "tool_calls": [c.for_history() for c in calls]})
         if claim is None:
@@ -705,14 +705,14 @@ class Session:
         return f"{label} {detail}".strip() if detail and len(detail) < 60 else label
 
     async def _run_tools(self, rid: int, calls: list[ToolCall], meta: dict, timing: dict, t_ref: float,
-                         pieces: asyncio.Queue) -> list[ToolResult]:
+                         pieces: asyncio.Queue, shown: list[str]) -> list[ToolResult]:
         registry = self.svc.tools
         # Tools that change something ask first, one at a time, before anything runs.
         allowed: dict[str, bool] = {}
         for call in calls:
             tool = registry.get(call.name)
             if tool and tool.confirm and not call.error:
-                allowed[call.id] = await self._ask_permission(rid, call, tool, pieces)
+                allowed[call.id] = await self._ask_permission(rid, call, tool, pieces, shown)
 
         async def one(call: ToolCall) -> ToolResult:
             tool = registry.get(call.name)
@@ -743,7 +743,7 @@ class Session:
 
     # ---------- asking permission ----------
 
-    async def _ask_permission(self, rid: int, call: ToolCall, tool, pieces: asyncio.Queue) -> bool:
+    async def _ask_permission(self, rid: int, call: ToolCall, tool, pieces: asyncio.Queue, shown: list[str]) -> bool:
         """The assistant asks before a tool that changes something; the user answers by voice or with the buttons.
         No answer within skills.confirm_timeout_s counts as no."""
         question = tool.confirm_text(call.args)
@@ -752,6 +752,7 @@ class Session:
         self.send({"type": "confirm_request", "id": rid, "call_id": call.id, "skill": tool.skill, "tool": call.name,
                    "text": question, "args": call.args})
         self.send({"type": "reply_delta", "id": rid, "text": " " + question})
+        shown.append(question)      # part of the reply: what follows is spaced after it, and it's saved with it
         pieces.put_nowait(question)
         self._state("confirm", question)
         try:

@@ -39,7 +39,7 @@ async def test_server_tools_confirmation_and_calls(tmp_path):
         assert listed.content["result"] == "1. buy milk"
         failed = await tools["fail"].run({"reason": "nope"}, None)
         assert not failed.ok and failed.content["error"]
-        assert tools["add_item"].confirm_text({"text": "buy milk"}) == "Should I use add item from todo with text: buy milk?"
+        assert tools["add_item"].confirm_text({"text": "buy milk"}) == "Should I add item “buy milk” using todo?"
     finally:
         await srv.stop()
     assert srv.skill.status == "off" and srv.skill.tools == []
@@ -166,3 +166,25 @@ async def test_choosing_a_folder_reconnects(tmp_path):
         assert (tmp_path / "work" / "todo.txt").exists()
     finally:
         await manager.close()
+
+
+def test_files_are_named_and_resolved_inside_the_servers_folder(tmp_path):
+    from mcp import types as mt
+    from ai_buddy.skills.mcp import McpTool, _summary
+    srv = McpServer("files", McpServerCfg(command="npx", args=["server", "{folder}"]), folder=str(tmp_path))
+    write = McpTool(srv, mt.Tool(name="write_file", description="Write a file.", input_schema={"type": "object"}))
+    args = {"path": f"{tmp_path}/Shopping.txt", "content": "milk\neggs\nbread"}
+    assert write.confirm_text(args) == "Should I write file “Shopping.txt” using files?"     # no path or content read out
+    assert write.describe(args) == "path: Shopping.txt, content: milk eggs bread"
+    assert write._in_folder({"path": "notes/a.md", "content": "x"}) == {"path": f"{tmp_path}/notes/a.md", "content": "x"}
+    assert write._in_folder({"paths": ["a.md", "/etc/x"]}) == {"paths": [f"{tmp_path}/a.md", "/etc/x"]}
+    fetch = McpTool(McpServer("fetch", McpServerCfg(command="uvx")),
+                    mt.Tool(name="fetch", description="Fetch a URL.", input_schema={"type": "object"}))
+    assert fetch._prepare({"url": "example.org"}) == {"url": "https://example.org"}
+    assert fetch._prepare({"url": "www.python.org/about"}) == {"url": "https://www.python.org/about"}
+    assert fetch._prepare({"url": "http://localhost:8000/x", "max_length": 5}) == {"url": "http://localhost:8000/x",
+                                                                                  "max_length": 5}
+    assert fetch._prepare({"url": "not a url"}) == {"url": "not a url"}
+    assert _summary('{"timezone": "Asia/Tokyo", "datetime": "2026-10-15T09:36:00+09:00", "is_dst": false}') == \
+        "timezone: Asia/Tokyo, datetime: 2026-10-15T09:36:00+09:00"
+    assert _summary("[FILE] ideas.md\n[FILE] shopping.txt") == "[FILE] ideas.md"

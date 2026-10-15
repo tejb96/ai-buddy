@@ -41,6 +41,10 @@ MAX_TEXT = 6000
 MAX_DESCRIPTION = 320           # characters of a tool's description the model reads (every request carries them)
 USER_BIN_DIRS = ("~/.local/bin", "~/.volta/bin", "~/.cargo/bin", "/usr/local/bin")
 _VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+# Arguments that name a file or folder: shown and spoken by their name, and resolved inside a server's {folder}.
+PATH_KEYS = {"path", "paths", "source", "destination", "file", "filename", "filepath", "file_path", "directory", "dir"}
+URL_KEYS = {"url", "uri", "href", "link"}
+_BARE_DOMAIN = re.compile(r"^(?:www\.)?[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,}(?::\d+)?(?:/\S*)?$", re.I)
 
 
 class McpConfigError(ValueError):
@@ -137,21 +141,68 @@ class McpTool(Tool):
                                                  "parameters": self.input_schema}}
 
     def describe(self, args: dict) -> str:
-        text = ", ".join(f"{k}: {v}" for k, v in args.items() if isinstance(v, (str, int, float, bool)))
-        return text[:80]
+        """Short text for the UI: a file by its name, other values cut short."""
+        parts = []
+        for k, v in args.items():
+            if k in PATH_KEYS and isinstance(v, str):
+                parts.append(f"{k}: {Path(v).name or v}")
+            elif isinstance(v, (str, int, float, bool)):
+                v = " ".join(str(v).split())
+                parts.append(f"{k}: {v[:40] + '…' if len(v) > 40 else v}")
+        return ", ".join(parts)[:80]
 
     def confirm_text(self, args: dict) -> str:
-        detail = self.describe(args)
-        return f"Should I use {self.remote.replace('_', ' ')} from {self.server.name}" + \
-            (f" with {detail}?" if detail else "?")
+        """The question asked out loud: the action and what it's about (a file by its name), not every argument;
+        the card shows them all."""
+        target = next((Path(v).name for k, v in args.items() if k in PATH_KEYS and isinstance(v, str) and v), "")
+        if not target:
+            target = next((" ".join(v.split()) for v in args.values() if isinstance(v, str) and 0 < len(v) <= 40), "")
+        about = f" “{target}”" if target else ""
+        return f"Should I {self.remote.replace('_', ' ')}{about} using {self.server.name}?"
+
+    def _prepare(self, args: dict) -> dict:
+        """Fix what a small model gets slightly wrong: "example.org" for a URL means https://example.org (as the
+        built-in fetch_page reads it), and relative paths mean paths inside the server's folder."""
+        args = {k: "https://" + v if k in URL_KEYS and isinstance(v, str) and _BARE_DOMAIN.match(v) else v
+                for k, v in args.items()}
+        return self._in_folder(args)
+
+    def _in_folder(self, args: dict) -> dict:
+        """Relative paths for a server that works in a folder ({folder}) mean paths inside that folder."""
+        folder = self.server.folder if self.server.needs_folder else ""
+        if not folder:
+            return args
+
+        def inside(v):
+            if isinstance(v, list):
+                return [inside(x) for x in v]
+            if not isinstance(v, str) or os.path.isabs(os.path.expanduser(v)):
+                return os.path.expanduser(v) if isinstance(v, str) else v
+            return os.path.normpath(os.path.join(folder, v))
+        return {k: inside(v) if k in PATH_KEYS else v for k, v in args.items()}
 
     async def run(self, args: dict, ctx: ToolContext) -> ToolResult:
-        result = await self.server.call(self.remote, args)
+        result = await self.server.call(self.remote, self._prepare(args))
         text = result_text(result)
-        first = text.splitlines()[0][:80] if text else ""
         if result.is_error:
-            return ToolResult({"error": text or "the tool reported an error"}, summary=first or "Failed", ok=False)
-        return ToolResult({"result": text}, summary=first or "Done")
+            return ToolResult({"error": text or "the tool reported an error"}, summary=_summary(text) or "Failed",
+                              ok=False)
+        return ToolResult({"result": text}, summary=_summary(text) or "Done")
+
+
+def _summary(text: str) -> str:
+    """One line for the UI from a tool's text result (a JSON result shows its first values)."""
+    if text[:1] in "{[":
+        try:
+            data = json.loads(text)
+        except ValueError:
+            data = None
+        if isinstance(data, dict):
+            pairs = [f"{k}: {v}" for k, v in data.items() if isinstance(v, (str, int, float, bool))]
+            return ", ".join(pairs[:2])[:80]
+        if isinstance(data, list):
+            return f"{len(data)} item{'s' if len(data) != 1 else ''}"
+    return text.splitlines()[0][:80] if text else ""
 
 
 class McpServer:
@@ -257,7 +308,8 @@ class McpServer:
                 if about:
                     self.skill.description = about
                 names = ", ".join(t.name for t in self.skill.tools)
-                where = f" Its folder is {self.folder}: use full paths inside it." if self.needs_folder else ""
+                where = (f" Its folder is {self.folder}: when the user says \"my folder\" or \"my files\", they "
+                         f"mean this folder; use full paths inside it." if self.needs_folder else "")
                 self.skill.instructions = (f"- {self.name} ({self.skill.description.rstrip('.')}): its tools are "
                                            f"{names}. Use them when the user asks for that; tools that change "
                                            f"something ask the user first, so just call them.{where}")

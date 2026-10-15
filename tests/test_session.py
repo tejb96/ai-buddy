@@ -149,6 +149,10 @@ async def test_actions_ask_first(tmp_path, allow):
     assert req["text"] in lm.spoken                      # Kira asks out loud
     assert events(s, "confirm_end")[0]["allowed"] is bool(allow)
     assert note.saved == (["buy milk"] if allow else [])
+    shown = "".join(e["text"] for e in events(s, "reply_delta"))
+    assert "(buy milk)? " in shown and "?Done" not in shown and "?Okay" not in shown     # the answer follows the question
+    if allow:
+        assert events(s, "reply_end")[-1]["text"] == "Should I go ahead with saving a note (buy milk)? Done."
     if not allow:
         assert "said no" in lm.requests[1]["messages"][-1]["content"]
 

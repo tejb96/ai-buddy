@@ -488,9 +488,11 @@ function onConfirmRequest(ev) {
   const r = state.replies.get(ev.id);
   if (!r) return;
   const answer = (allow) => net.send({ type: "confirm", call_id: ev.call_id, allow });
+  const args = Object.entries(ev.args || {}).map(([k, v]) => `${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`);
   const card = el("div", { class: "confirm", "data-call": ev.call_id },
     el("div", { class: "confirm-q" }, ev.text),
     el("div", { class: "confirm-detail muted small" }, `${ev.skill} · ${ev.tool}`),
+    args.length ? el("div", { class: "confirm-args small" }, args.join("\n")) : null,
     el("div", { class: "row" },
       el("button", { type: "button", class: "btn primary", onclick: () => answer(true) }, "Yes, go ahead"),
       el("button", { type: "button", class: "btn", onclick: () => answer(false) }, "No")),
@@ -929,7 +931,9 @@ function applySkills() {
   const on = state.config.skills.filter((s) => s.enabled && s.status === "ready");
   const phrases = on.map((s) => SKILL_PHRASES[s.name] || `use ${s.label}`);
   const list = phrases.length > 1 ? `${phrases.slice(0, -1).join(", ")} and ${phrases.at(-1)}` : phrases[0];
-  $("chat-skills-line").textContent = list ? `I can ${list}.` : "Every skill is switched off; turn some on in Settings.";
+  // The empty-chat panel is taken off the page once the chat has messages (and put back for a new chat).
+  chatEmpty.querySelector("#chat-skills-line").textContent =
+    list ? `I can ${list}.` : "Every skill is switched off; turn some on in Settings.";
   if (state.mode && state.mode !== "history" && !modes.has(state.mode)) switchMode("chat");
 }
 
