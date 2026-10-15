@@ -16,13 +16,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # the repo root
 from ai_buddy.config import load_config  # noqa: E402
-from ai_buddy.prompts import chat_system_prompt  # noqa: E402
+from ai_buddy.prompts import Persona, chat_system_prompt  # noqa: E402
 
-from common import http, load, loaded, seconds, silence, synth, wav  # noqa: E402
+from common import hearing, http, load, loaded, seconds, silence, synth, wav  # noqa: E402
 
 LLM = sys.argv[1] if len(sys.argv) > 1 else "gemma4-it-12b-FLM"
 CFG = load_config()
-SYSTEM = chat_system_prompt(CFG.persona, "America/Edmonton", hearing="audio")
+SYSTEM = hearing(chat_system_prompt(Persona("Kira", CFG.persona.style), "America/Edmonton"), "audio")
 SAYS = ["Hey Kira, I just finished a long run and I'm exhausted.",
         "About ten kilometers, along the river. It was beautiful.",
         "What should I eat to recover?",

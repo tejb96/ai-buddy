@@ -7,7 +7,7 @@ from datetime import date
 import pytest
 
 from ai_buddy.config import load_config
-from ai_buddy.router import missing, route
+from ai_buddy.router import route
 from ai_buddy.skills import SkillSet, discover
 from ai_buddy.tools import ToolCall, ToolContext
 
@@ -72,16 +72,6 @@ def test_everything_else_is_left_to_the_model(text):
 def test_notes_need_a_knowledge_base():
     ctx = Ctx(load_config(), None, None, "UTC")
     assert route("What's in my notes about the budget?", REG, ctx) == []
-
-
-def test_missing_compares_by_tool_name():
-    a = ToolCall("1", "get_datetime", {"timezone": "Europe/Paris"}, "", routed=True)
-    b = ToolCall("2", "web_search", {"query": "Paris weather"}, "", routed=True)
-    model = [ToolCall("m", "web_search", {"query": "weather in Paris, France"}, "")]
-    assert missing([a, b], model) == [a]
-    assert missing([a, b], []) == [a, b]
-    broken = [ToolCall("m", "get_datetime", {}, "", error="bad")]
-    assert missing([a], broken) == [a]
 
 
 def test_routes_only_use_enabled_tools():

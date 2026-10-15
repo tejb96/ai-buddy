@@ -1,4 +1,4 @@
-# Conversation-practice scenarios. Kira plays the other person; {details} is what the user typed.
+# Conversation-practice scenarios. The assistant plays the other person; {details} is what the user typed.
 # notes_query: what to look up in the knowledge folder for background ("" = nothing).
 
 [job_interview]
@@ -39,7 +39,7 @@ flowing naturally, but leave room for the user to lead. Open by introducing your
 
 [custom]
 title = "Custom scenario"
-blurb = "Describe any situation and who Kira should play."
+blurb = "Describe any situation and who the other person is."
 placeholder = "e.g. You're a customer returning a broken laptop and I'm the store clerk"
 default = "a casual conversation between colleagues"
 counterpart = "Partner"

@@ -28,11 +28,11 @@ from ai_buddy.audio import PresentationChunker, analyze_speech, has_speech  # no
 from ai_buddy.config import load_config  # noqa: E402
 from ai_buddy.knowledge import KnowledgeBase  # noqa: E402
 from ai_buddy.metrics import Answer, compute_metrics, count_fillers  # noqa: E402
-from ai_buddy.prompts import chat_system_prompt  # noqa: E402
+from ai_buddy.prompts import Persona, chat_system_prompt  # noqa: E402
 from ai_buddy.skills import SkillSet  # noqa: E402
 from ai_buddy.tools import ToolContext, ToolRegistry  # noqa: E402
 
-from common import BASE, ThermalLog, dump, load, loaded, silence, synth, transcribe, wav, wer  # noqa: E402
+from common import BASE, ThermalLog, dump, hearing, load, loaded, silence, synth, transcribe, wav, wer  # noqa: E402
 
 LLM = sys.argv[1] if len(sys.argv) > 1 else "gemma4-it-12b-FLM"
 MODE = sys.argv[2] if len(sys.argv) > 2 else "heard"
@@ -108,7 +108,8 @@ def audio_msg(pcm: bytes) -> dict:
 
 
 def system_prompt() -> str:
-    return chat_system_prompt(CFG.persona, TZ, SKILLS.chat_instructions(), "heard" if MODE == "heard" else "audio")
+    return hearing(chat_system_prompt(Persona("Kira", CFG.persona.style), TZ, SKILLS.chat_instructions()),
+                   "heard" if MODE == "heard" else "audio")
 
 
 def spoken_breaks(text: str) -> list[str]:

@@ -18,7 +18,7 @@ SCENARIOS: dict[str, dict] = tomllib.loads((HERE / "assets" / "scenarios.toml").
 KICKOFF = "[The practice conversation starts now. Say your opening line.]"
 
 
-def section(title: str, persona: str = "Kira") -> str:
+def section(title: str, persona: str = "Bella") -> str:
     """One '## title' section of SKILL.md, with its wrapped lines joined into paragraphs."""
     _, body = parse_skill_md((HERE / "SKILL.md").read_text())
     m = re.search(rf"^## {re.escape(title)}\s*$(.*?)(?=^## |\Z)", body, re.M | re.S)
@@ -27,7 +27,7 @@ def section(title: str, persona: str = "Kira") -> str:
     return "\n\n".join(paras).replace("{persona}", persona)
 
 
-def roleplay_system_prompt(scenario: str, details: str, background: str = "", persona: str = "Kira") -> str:
+def roleplay_system_prompt(scenario: str, details: str, background: str = "", persona: str = "Bella") -> str:
     s = SCENARIOS[scenario]
     parts = [s["prompt"].format(details=details.strip() or s["default"]), section("Role-play", persona)]
     if background:
@@ -101,7 +101,7 @@ def format_metrics(m: dict) -> str:
 
 
 def feedback_messages(kind: str, transcript: str, metrics: dict, scenario: str | None = None, details: str = "",
-                      talking_points: str = "", persona: str = "Kira") -> list[dict]:
+                      talking_points: str = "", persona: str = "Bella") -> list[dict]:
     if kind == "presentation":
         intro = "The user just practiced a presentation, speaking without interruption."
         if details.strip():

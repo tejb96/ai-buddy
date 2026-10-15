@@ -9,10 +9,10 @@ metadata:
 # Speaking coach
 
 This skill gives the app two practice modes. In **Presentation** mode, {persona} listens to a whole talk. In
-**Conversation practice**, she plays the other person in a scenario from `assets/scenarios.toml`. When the user
-finishes, she writes feedback. It's based on the verbatim Whisper transcript, with filler words kept, and on
-delivery numbers measured from the audio: pace, filler words, pauses, sentence length and repeated phrases. The
-sections below are her instructions, loaded only when a practice session runs.
+**Conversation practice**, {persona} plays the other person in a scenario from `assets/scenarios.toml`. When the
+user finishes, {persona} writes feedback. It's based on the verbatim Whisper transcript, with filler words kept,
+and on delivery numbers measured from the audio: pace, filler words, pauses, sentence length and repeated
+phrases. The sections below are the assistant's instructions, loaded only when a practice session runs.
 
 ## Feedback
 

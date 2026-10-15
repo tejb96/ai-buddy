@@ -42,6 +42,7 @@ const state = {
   handsFree: false,
   replies: new Map(),      // reply id -> {msg, text, readout}
   pendingUser: null,
+  exiting: false,          // Exit was pressed: don't reconnect
   pres: { phase: "ready", t0: 0, timer: 0, captions: [], result: null, sessionId: null },
   iv: { phase: "setup", scenario: "job_interview", details: "", messages: [], result: null, sessionId: null },
 };
@@ -65,7 +66,7 @@ const net = {
       state.serverMode = null;
       if (state.recording) { state.recording = false; audio.stop(true); }
       render();
-      setTimeout(() => this.connect(), Math.min(5000, 400 * 2 ** this.retry++));
+      if (!state.exiting) setTimeout(() => this.connect(), Math.min(5000, 400 * 2 ** this.retry++));
     };
     ws.onmessage = (e) => (typeof e.data === "string" ? onEvent(JSON.parse(e.data)) : onSpeech(e.data));
     this.ws = ws;
@@ -366,6 +367,41 @@ function onFeedbackCancelled(ev) {
   toast(ev.text, ev.error ? "error" : "info", ev.error ? 9000 : 4500);
 }
 
+// ---------------------------------------------------------------- scrolling
+
+// The page scrolls and the dock floats over its bottom (main has room for it). New content keeps the view at the
+// bottom only while you're already there: scroll up and it stays put, with a button to jump back down.
+const scroller = {
+  follow: true,
+  atBottom() {
+    const doc = document.documentElement;
+    return doc.scrollHeight - (window.scrollY + window.innerHeight) < 48;
+  },
+  onScroll() {
+    this.follow = this.atBottom();
+    if (this.follow) $("jump-latest").hidden = true;
+  },
+  // After adding or growing content. `force`: the user just did something (talked, opened the chat).
+  update(force = false) {
+    if (force) this.follow = true;
+    if (this.follow) {
+      window.scrollTo(0, document.documentElement.scrollHeight);
+      $("jump-latest").hidden = true;
+    } else if (state.mode === "chat" || state.mode === "interview") {
+      $("jump-latest").hidden = false;
+    }
+  },
+  bind() {
+    window.addEventListener("scroll", () => this.onScroll(), { passive: true });
+    // Scrolling up by hand stops following at once, before the next streamed word could pull the view back.
+    window.addEventListener("wheel", (e) => { if (e.deltaY < 0) this.follow = false; }, { passive: true });
+    window.addEventListener("keydown", (e) => {
+      if (["PageUp", "ArrowUp", "Home"].includes(e.key) && !isTyping(e.target)) this.follow = false;
+    });
+    $("jump-latest").addEventListener("click", () => this.update(true));
+  },
+};
+
 // ---------------------------------------------------------------- conversation threads
 
 const activeThread = () => (state.serverMode === "interview" ? $("iv-thread") : $("chat-thread"));
@@ -384,7 +420,7 @@ function bubble(role, text, who) {
   const thread = activeThread();
   thread.querySelector(".empty")?.remove();
   thread.append(msg);
-  msg.scrollIntoView({ block: "end", behavior: "smooth" });
+  scroller.update(role === "user");     // your own words always bring the view down
   return msg;
 }
 
@@ -402,6 +438,7 @@ function dropPendingUser() {
 function showPartialUser(text) {
   if (!state.pendingUser) return;
   state.pendingUser.querySelector(".bubble").textContent = `${text} …`;
+  scroller.update();
 }
 
 function fillPendingUser(text) {
@@ -432,6 +469,7 @@ function onToolStart(ev) {
     el("span", { class: "tool-label" }, ev.label), ev.detail ? el("span", { class: "tool-detail" }, ev.detail) : null);
   box.append(row);
   r.tools.set(ev.call_id, row);
+  scroller.update();
 }
 
 function onToolEnd(ev) {
@@ -458,7 +496,7 @@ function onConfirmRequest(ev) {
       el("button", { type: "button", class: "btn", onclick: () => answer(false) }, "No")),
     el("div", { class: "muted small" }, "Or hold Space and say yes or no."));
   r.msg.append(card);
-  card.scrollIntoView({ block: "end", behavior: "smooth" });
+  scroller.update();
 }
 
 function onConfirmEnd(ev) {
@@ -497,7 +535,7 @@ function appendReply(id, delta) {
   if (!r) return;
   r.text += delta;
   r.msg.querySelector(".bubble").textContent = stripEmoji(r.text).trimStart();
-  r.msg.scrollIntoView({ block: "end" });
+  scroller.update();
 }
 
 function endReply(ev) {
@@ -513,6 +551,7 @@ function endReply(ev) {
   }
   const sources = sourceList(ev.sources);
   if (sources) r.msg.append(sources);
+  scroller.update();
   if (state.serverMode === "interview") state.iv.messages.push({ role: "assistant", text: b.textContent });
 }
 
@@ -543,6 +582,7 @@ function addCaption(ev) {
   state.pres.captions.push(ev.text);
   $("pres-live-hint").hidden = true;
   $("pres-captions").append(el("p", {}, el("span", { class: "t" }, fmtClock(ev.start_s)), ev.text));
+  scroller.update();
 }
 
 function renderPresentation() {
@@ -620,6 +660,7 @@ function cancelSpeechLocal() { player.stopAll(); }
 
 function renderInterview() {
   const iv = state.iv;
+  const firstResults = iv.result && !iv.resultsShown && (iv.phase === "ending" || iv.phase === "results");
   $("iv-setup").hidden = iv.phase !== "setup";
   $("iv-running").hidden = iv.phase === "setup";
   $("iv-end").hidden = iv.phase !== "running";
@@ -631,8 +672,10 @@ function renderInterview() {
         ["Practice again", () => { iv.phase = "setup"; iv.result = null; renderInterview(); render(); }, () => iv.result.done],
       ],
     });
-    results.scrollIntoView({ behavior: "smooth", block: "start" });
+    if (firstResults) results.scrollIntoView({ behavior: "smooth", block: "start" });
+    iv.resultsShown = true;
   } else {
+    iv.resultsShown = false;
     results.replaceChildren();
   }
 }
@@ -815,11 +858,11 @@ async function deleteSession(id) {
 
 function renderModels() {
   if (!state.models) return;
-  const labels = { stt: ["Whisper", "NPU"], llm: [state.config.persona, "NPU"], tts: ["Voice", "CPU"],
-    embed: ["Notes search", "CPU"] };
+  const labels = { stt: "Whisper", llm: state.config.persona, tts: "Voice", embed: "Notes search" };
   const box = $("models");
   box.replaceChildren(...Object.entries(state.models).map(([role, m]) => {
-    const [name, device] = labels[role] || [role, ""];
+    const name = labels[role] || role;
+    const device = m.device || "";
     const note = { ready: "", loading: "loading", standby: "standby", error: "error", unknown: "…" }[m.state] ?? m.state;
     return el("span", { class: "pill", "data-state": m.state, title: `${m.name} on the ${device}: ${m.state}` },
       el("span", { class: "dot" }), name, note ? el("span", { class: "state" }, note) : null);
@@ -910,10 +953,31 @@ function switchMode(mode) {
   }
   if (mode === "interview" && state.serverMode !== "interview") { state.iv.phase = "setup"; renderInterview(); }
   if (mode === "history") renderHistory();
+  if (mode === "chat" || mode === "interview") scroller.update(true);
+  else window.scrollTo(0, 0);
   render();
 }
 
 // ---------------------------------------------------------------- settings
+
+const LLM_NOTES = {
+  "qwen3.5-9b-FLM": "The default. Reads Whisper's transcript of what you say; good with tools.",
+  "gemma4-it-12b-FLM": "Reads Whisper's transcript too; reliable with tools, a little slower to answer.",
+  "qwen3.6-moe-35b-a3b-FLM": "Accurate, but needs much more memory (22 GB) and takes longer to start answering.",
+};
+const STT_NOTES = {
+  "whisper-v3-turbo-FLM": "Whisper Large v3 Turbo on the NPU (FastFlowLM): the default, light on power.",
+  "Whisper-Large-v3-Turbo": "The same Whisper model on whisper.cpp, running on the CPU instead of the NPU. " +
+    "In earlier tests it made fewer mistakes on real speech and kept more filler words.",
+};
+
+// The assistant is named after its voice (Bella by default).
+function setPersona(name) {
+  if (!name || !state.config) return;
+  state.config.persona = name;
+  document.querySelectorAll(".persona-name").forEach((e) => { e.textContent = name; });
+  renderModels();
+}
 
 const settingsUI = {
   data: null,
@@ -929,15 +993,17 @@ const settingsUI = {
       return toast(`Couldn't load settings: ${err.message}`, "error");
     }
     const d = this.data;
+    setPersona(d.persona);
+    const option = (value, label, selected, isDefault) =>
+      el("option", { value, selected }, isDefault ? `${label} — default` : label);
     $("set-voice").replaceChildren(...Object.entries(d.voices).map(([id, label]) =>
-      el("option", { value: id, selected: id === d.voice }, id === "af_heart" ? `${label} — default` : label)));
-    const notes = { "gemma4-it-12b-FLM": "Hears your voice directly; the most reliable with tools.",
-      "qwen3.6-moe-35b-a3b-FLM": "Reads Whisper's transcript; accurate, needs more memory (22 GB).",
-      "qwen3-it-4b-FLM": "Starts talking sooner, but makes things up more often." };
-    $("set-llm").replaceChildren(...d.llms.map((m) => el("option", { value: m, selected: m === d.llm }, m)));
-    $("set-llm-note").textContent = notes[d.llm] || "";
-    $("set-models").textContent = `Language model: ${d.llm} (NPU${d.hears_audio ? ", hears your voice" : ""}) · ` +
-      `Speech-to-text: ${d.stt} (NPU) · Voice: ${d.tts} (CPU)` + (d.embed ? ` · Notes search: ${d.embed} (CPU)` : "") +
+      option(id, label, id === d.voice, id === d.default_voice)));
+    $("set-llm").replaceChildren(...d.llms.map((m) => option(m, m, m === d.llm, m === d.default_llm)));
+    $("set-llm-note").textContent = LLM_NOTES[d.llm] || "";
+    $("set-stt").replaceChildren(...d.stts.map((m) => option(m, m, m === d.stt, m === d.default_stt)));
+    $("set-stt-note").textContent = STT_NOTES[d.stt] || "";
+    $("set-models").textContent = `Language model: ${d.llm} (NPU) · Speech-to-text: ${d.stt} (${d.stt_device}) · ` +
+      `Voice: ${d.tts} (CPU)` + (d.embed ? ` · Notes search: ${d.embed} (CPU)` : "") +
       ". Nothing leaves this laptop except web searches and the MCP servers you connect.";
     this.renderSkills(d.skills);
     $("pick-folder").hidden = !d.can_pick_folder;
@@ -1006,10 +1072,33 @@ const settingsUI = {
     await this.load();
     return true;
   },
+  // One voice sample at a time: a new one (or Stop, or closing Settings) stops the one playing.
+  sample: null,
   previewVoice() {
-    const voice = $("set-voice").value;
-    const a = new Audio(`/api/voice/preview?voice=${encodeURIComponent(voice)}`);
-    a.play().catch((err) => toast(`Couldn't play the sample: ${err.message}`, "error"));
+    this.stopSample();
+    const a = new Audio(`/api/voice/preview?voice=${encodeURIComponent($("set-voice").value)}`);
+    this.sample = a;
+    $("stop-voice").disabled = false;
+    const done = () => {
+      if (this.sample !== a) return;
+      this.sample = null;
+      $("stop-voice").disabled = true;
+    };
+    a.addEventListener("ended", done);
+    a.addEventListener("error", done);
+    a.play().catch((err) => {
+      done();
+      if (err.name !== "AbortError") toast(`Couldn't play the sample: ${err.message}`, "error");
+    });
+  },
+  stopSample() {
+    const a = this.sample;
+    this.sample = null;
+    $("stop-voice").disabled = true;
+    if (!a) return;
+    a.pause();
+    a.removeAttribute("src");   // also cancels a sample that's still being synthesized
+    a.load();
   },
   async pickFolder() {
     let res;
@@ -1027,10 +1116,20 @@ const settingsUI = {
     $("open-settings").addEventListener("click", () => this.open());
     $("close-settings").addEventListener("click", () => $("settings").close());
     $("settings").addEventListener("click", (e) => { if (e.target === $("settings")) $("settings").close(); });
-    $("set-voice").addEventListener("change", (e) => this.save({ voice: e.target.value }).then((ok) => ok && this.previewVoice()));
+    $("settings").addEventListener("close", () => this.stopSample());
+    $("set-voice").addEventListener("change", (e) => {
+      const voice = e.target.value;
+      this.stopSample();
+      // Play the new voice once it's saved, unless Settings was closed or another voice picked meanwhile.
+      this.save({ voice }).then((ok) => ok && $("settings").open && $("set-voice").value === voice && this.previewVoice());
+    });
     $("preview-voice").addEventListener("click", () => this.previewVoice());
+    $("stop-voice").addEventListener("click", () => this.stopSample());
     $("set-llm").addEventListener("change", async (e) => {
       if (await this.save({ llm: e.target.value })) toast(`Switching to ${e.target.value}. It takes a few seconds to load.`);
+    });
+    $("set-stt").addEventListener("change", async (e) => {
+      if (await this.save({ stt: e.target.value })) toast(`Switching speech-to-text to ${e.target.value}.`);
     });
     $("pick-folder").addEventListener("click", () => this.pickFolder());
     $("use-folder").addEventListener("click", async () => {
@@ -1047,6 +1146,38 @@ const settingsUI = {
     });
   },
 };
+
+// ---------------------------------------------------------------- exit
+
+// Exit: the server stops every session, unloads all models from Lemonade and shuts down; then this window closes
+// (the app window is also closed by the launcher, which opened it).
+async function exitApp() {
+  if (!confirm(`Exit AI Buddy? ${state.config.persona} stops and all models are unloaded from Lemonade.`)) return;
+  state.exiting = true;
+  player.stopAll();
+  settingsUI.stopSample();
+  if (state.recording) { state.recording = false; state.talkIntent = false; audio.stop(true); }
+  showStopped("Stopping AI Buddy…", "Unloading the models from Lemonade.");
+  let res = null;
+  try {
+    res = await api("/api/exit", { method: "POST" });
+  } catch (err) {
+    showStopped("AI Buddy has stopped.", `Couldn't confirm that the models were unloaded (${err.message}).`);
+  }
+  if (res) {
+    showStopped("AI Buddy has stopped.", res.unloaded ? "The models are unloaded. You can close this window."
+      : "Lemonade didn't unload the models; check it with `lemonade status`. You can close this window.");
+  }
+  net.ws?.close();
+  setTimeout(() => window.close(), 300);
+}
+
+function showStopped(title, text) {
+  for (const d of document.querySelectorAll("dialog[open]")) d.close();
+  $("stopped-title").textContent = title;
+  $("stopped-text").textContent = text;
+  $("stopped").hidden = false;
+}
 
 // ---------------------------------------------------------------- toasts
 
@@ -1094,6 +1225,8 @@ function bindUI() {
   });
   window.addEventListener("blur", () => { if (state.recording && !toggleMode() && !state.handsFree) endTalk(); });
 
+  $("exit-app").addEventListener("click", exitApp);
+  scroller.bind();
   $("iv-setup").addEventListener("submit", startInterview);
   $("iv-end").addEventListener("click", endInterview);
   $("handsfree").addEventListener("change", async (e) => {
@@ -1110,7 +1243,7 @@ function bindUI() {
 async function main() {
   chatEmpty = $("chat-empty");
   state.config = await api("/api/config");
-  document.querySelectorAll(".persona-name").forEach((e) => { e.textContent = state.config.persona; });
+  setPersona(state.config.persona);
   buildScenarios();
   bindUI();
   settingsUI.bind();

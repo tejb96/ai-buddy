@@ -9,13 +9,16 @@ load_timeout_s = 180
 
 [models]
 # Everything runs locally through Lemonade: FLM models on the NPU, Kokoro on the CPU.
-stt = "whisper-v3-turbo-FLM"            # speech-to-text (NPU)
-llm = "gemma4-it-12b-FLM"               # Kira: hears your voice; conversation, tools, coaching; thinking off (NPU)
+stt = "whisper-v3-turbo-FLM"            # speech-to-text (NPU); its transcript is what the LLM reads
+llm = "qwen3.5-9b-FLM"                  # the assistant: conversation, tools, coaching; thinking off (NPU)
 tts = "kokoro-v1"                       # text-to-speech (CPU)
 llm_ctx_size = 32768
-# Models offered in the settings panel. The 35B reads Whisper's text instead of your voice and needs 22 GB;
-# the 4B starts talking sooner but makes up answers more often.
-llm_choices = ["gemma4-it-12b-FLM", "qwen3.6-moe-35b-a3b-FLM", "qwen3-it-4b-FLM"]
+# Language models offered in the settings panel. Gemma 4 12B is a little slower to answer; the 35B needs 22 GB.
+llm_choices = ["qwen3.5-9b-FLM", "gemma4-it-12b-FLM", "qwen3.6-moe-35b-a3b-FLM"]
+# Speech-to-text models offered in the settings panel. Whisper-Large-v3-Turbo is the same model on whisper.cpp,
+# run on the CPU (stt_backend; "vulkan" would use the iGPU after `lemonade backends install whispercpp:vulkan`).
+stt_choices = ["whisper-v3-turbo-FLM", "Whisper-Large-v3-Turbo"]
+stt_backend = "cpu"
 # Embedding model for note search, run by llama.cpp on the CPU; search then combines meaning and keywords.
 # "" = keywords only. Changing it re-embeds the notes. NOT SET UP YET (see docs/phase0-findings.md, "Start
 # here"): first `lemonade backends install llamacpp:cpu` and `lemonade pull Qwen3-Embedding-0.6B-GGUF`,
@@ -32,11 +35,6 @@ history_word_budget = 8000
 # Kira writes a short greeting when a chat starts; it also preloads the model's prompt cache.
 greet = true
 timeout_s = 90                # give up on a reply that takes longer than this
-# With an LLM that hears audio (gemma4-it-12b-FLM), send your recording to it directly instead of Whisper's text.
-audio_input = true
-# Where your chat bubble's transcript comes from with audio input: "whisper" (transcribed alongside the reply)
-# or "heard" (the LLM writes what it heard before replying). Practice modes always use Whisper.
-transcript = "whisper"
 
 [feedback]
 # Lets the model "think" before writing feedback: deeper, but 30 s or more slower.
@@ -52,16 +50,16 @@ live_chunk_max_s = 25
 live_pause_s = 0.5
 
 [voice]
-tts_voice = "af_heart"   # default Kokoro voice; pick another in the app
+tts_voice = "af_bella"   # default Kokoro voice; pick another in the app. The assistant is named after it: Bella
 tts_speed = 1.0
 language = "en"
 
 [persona]
-name = "Kira"
+# The assistant's name is its voice's name (Bella, Emma, George...): change the voice to change the name.
 style = "warm, encouraging and honest"
 
 [user]
-location = ""                 # e.g. "Calgary, Alberta": Kira assumes it when you don't name a place
+location = ""                 # e.g. "Calgary, Alberta": assumed when you don't name a place
 
 [skills]
 # Every capability is a skill (Agent Skills format: a folder with SKILL.md; built-ins in ai_buddy/skills/builtin).

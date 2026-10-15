@@ -9,18 +9,15 @@ Wire protocol (WebSocket /ws):
                              tool_start/tool_end, confirm_request/confirm_end, caption, metrics,
                              feedback_status/delta/done/cancelled, notice, error
 
-Chat with an LLM that hears audio (gemma4-it-12b-FLM): the recording itself goes to the model and stays in
-the history as audio, which keeps FLM's prompt cache (a transcript in its place would change the prompt and
-make FLM re-read the whole conversation every turn). The transcript for the chat bubble and the router comes
-from Whisper first (the NPU runs one job at a time, see ai_buddy.models), or, with chat.transcript = "heard",
-from the model's own <heard> block; then Kira's reply is held back until that block is written, so the router
-(ai_buddy.router) can still make the tool calls a request needs.
+In chat, Whisper (FLM, on the NPU) transcribes what the user said and the LLM gets that text: the same words
+go to the chat bubble, the history and the router (ai_buddy.router), which makes the tool calls a request
+clearly needs before the model runs. (Until 2026-10-14 Gemma 4 heard the recording itself; in real use it
+misheard short phrases that Whisper got right, so the app went back to text.)
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextlib
 import json
 import logging
@@ -33,14 +30,14 @@ from types import ModuleType
 
 from fastapi import WebSocket
 
-from .audio import PresentationChunker, analyze_speech, has_speech, pcm_seconds, pcm_to_wav
+from .audio import PresentationChunker, analyze_speech, has_speech, pcm_seconds
 from .config import Config
 from .knowledge import KnowledgeBase, keywords
 from .lemonade import Lemonade, LemonadeError
 from .metrics import Answer, compute_metrics, words
 from .models import ModelManager
-from .prompts import CHAT_KICKOFF, NUDGE, chat_system_prompt, notes_block
-from .router import missing, route
+from .prompts import CHAT_KICKOFF, NUDGE, Persona, chat_system_prompt, notes_block
+from .router import route
 from .skills import SkillSet
 from .storage import Store
 from .text import SpeechChunker, clean_for_speech, strip_emoji
@@ -49,8 +46,6 @@ from .tools import RESULTS_PREFIX, ToolCall, ToolContext, ToolRegistry, ToolResu
 log = logging.getLogger(__name__)
 
 MODES = ("chat", "presentation", "interview")
-AUDIO_MAX_S = 30        # longer chat turns go to the model as Whisper's text (its live, chunked transcript)
-AUDIO_WORDS_PER_S = 19  # an audio turn costs ~25 tokens/s of context, about this many words of text
 # "Let me look that up." with no tool call: the model announced a lookup instead of doing it.
 _ANNOUNCE = re.compile(r"\b(let me|i'?ll|i will|one (sec|second|moment)|give me a (sec|second|moment)|hang on|"
                        r"hold on)\b[^.!?]{0,60}\b(look|check|search|find|pull|see|get)", re.I)
@@ -65,25 +60,6 @@ def yes_or_no(text: str) -> bool | None:
     if _NO.search(text):
         return False
     return True if _YES.search(text) else None
-
-
-def audio_part(pcm: bytes) -> dict:
-    return {"type": "input_audio", "input_audio": {"data": base64.b64encode(pcm_to_wav(pcm)).decode(), "format": "wav"}}
-
-
-def split_heard(text: str) -> tuple[str, str | None, str]:
-    """Parse the start of a reply that should open with <heard>...</heard>.
-    Returns ("wait", None, "") while it's undecided, ("done", transcript, rest) once the block is closed,
-    or ("none", None, text) when the reply doesn't start with one."""
-    s = text.lstrip()
-    if s.startswith("<heard>"):
-        if "</heard>" not in s:
-            return "wait", None, ""
-        inner, _, rest = s[len("<heard>"):].partition("</heard>")
-        return "done", " ".join(inner.split()), rest.lstrip()
-    if "<heard>".startswith(s):
-        return "wait", None, ""
-    return "none", None, text
 
 
 @dataclass
@@ -109,6 +85,11 @@ class Services:
     def skills_changed(self) -> None:
         self._registry = None
 
+    @property
+    def persona(self) -> Persona:
+        """The assistant, named after the voice in use."""
+        return Persona.of(self.cfg, self.models.voice)
+
 
 @dataclass
 class Filler:
@@ -117,23 +98,11 @@ class Filler:
 
 
 @dataclass
-class Heard:
-    """An audio chat turn in "heard" mode: the model writes the user's words before its reply."""
-    msg: dict                                  # the user's message in the history (audio)
-    pcm: bytes
-    text: str | None = None
-    known: bool = False
-    parsed: bool = False                       # the model's <heard> block (or its absence) has been seen
-    routed: list[ToolCall] = field(default_factory=list)
-
-
-@dataclass
 class Round:
     """One LLM request: what the model wrote (for the history), what was shown and spoken, its tool calls."""
     raw: str = ""
     text: str = ""
     calls: list[dict] = field(default_factory=list)
-    stopped: list[ToolCall] = field(default_factory=list)   # routed calls to make instead of a cut-off answer
 
 
 class LiveTranscript:
@@ -324,40 +293,21 @@ class Session:
         else:
             self.turn_task = asyncio.create_task(self._guard(self._opening_line()))
 
-    # ---------- how the user's words reach the model ----------
-
-    def _hearing(self) -> str:
-        """"text" (Whisper's transcript), "audio" (the recording; Whisper alongside for the bubble) or "heard"
-        (the recording; the model writes the transcript)."""
-        if self.mode != "chat" or not self.models.hears_audio():
-            return "text"
-        return "heard" if self.cfg.chat.transcript == "heard" else "audio"
+    # ---------- the chat prompt ----------
 
     def _chat_prompt(self) -> str:
         skills = self.svc.skills
-        return chat_system_prompt(self.cfg.persona, self.svc.tool_ctx.timezone, skills.chat_instructions(),
-                                  self._hearing(), self.cfg.user.location, skills.extra_instructions())
+        return chat_system_prompt(self.svc.persona, self.svc.tool_ctx.timezone, skills.chat_instructions(),
+                                  self.cfg.user.location, skills.extra_instructions())
 
     def _refresh_chat_prompt(self) -> None:
-        """Follow skill switches and model changes. Changing the prompt makes FLM re-read the conversation
-        once, so it only happens when something actually changed."""
+        """Follow skill switches and voice changes (the assistant's name). Changing the prompt makes FLM re-read
+        the conversation once, so it only happens when something actually changed."""
         if self.mode != "chat" or not self.history:
             return
-        if self._hearing() == "text":
-            self._audio_to_text()   # a model that doesn't hear audio can't read earlier recordings
         prompt = self._chat_prompt()
         if self.history[0]["content"] != prompt:
             self.history[0] = {"role": "system", "content": prompt}
-
-    def _audio_to_text(self, keep_last: bool = False) -> None:
-        """Replace recordings in the history with their transcripts (`keep_last`: not the turn in progress)."""
-        for i, m in enumerate(self.history[:-1] if keep_last else self.history):
-            if isinstance(m.get("content"), list):
-                self.history[i] = {"role": m["role"], "content": m.get("_transcript") or "(a voice message)"}
-
-    def _wire(self) -> list[dict]:
-        """The history as the API gets it (private keys, like a recording's transcript, removed)."""
-        return [{k: v for k, v in m.items() if not k.startswith("_")} for m in self.history]
 
     # ---------- recording ----------
 
@@ -369,15 +319,15 @@ class Session:
                 return self._notice("Hang on, I'm still writing feedback for your last talk.")
             self._begin_talk()
         elif self.pending_confirm:
-            self.live = None        # the user is answering Kira's yes/no question: don't cut her off
+            self.live = None        # the user is answering a yes/no question: don't cut the assistant off
         else:
-            # Barge-in: pressing talk while Kira is speaking or thinking cancels that reply.
+            # Barge-in: pressing talk while the assistant is speaking or thinking cancels that reply.
             if self.turn_task and not self.turn_task.done():
                 self.turn_task.cancel()
             if self.live:
                 self.live.cancel()
             s = self.cfg.stt
-            self.live = None if self._hearing() == "heard" else LiveTranscript(
+            self.live = LiveTranscript(
                 self, PresentationChunker(target_s=s.live_chunk_s, max_s=s.live_chunk_max_s, quiet_s=s.live_pause_s))
         self.rec = bytearray()
         self.recording = True
@@ -424,7 +374,7 @@ class Session:
         except LemonadeError as e:
             self._error(e)
         except TimeoutError:
-            self._error(f"{self.cfg.persona.name} took too long to answer, so I stopped waiting. Please try again.")
+            self._error(f"{self.svc.persona.name} took too long to answer, so I stopped waiting. Please try again.")
         except Exception as e:
             log.exception("turn failed")
             self._error(f"Something went wrong: {e}")
@@ -449,6 +399,13 @@ class Session:
         self.send({"type": "feedback_cancelled", "session_id": sid, "text": text, "error": error})
         if self.mode in ("presentation", "interview"):
             self._state("idle")
+
+    async def stop(self) -> None:
+        """The app is exiting: stop everything, feedback still being written included, and save the session."""
+        for task in list(self.feedback_tasks):
+            task.cancel()
+        await self._close_session()
+        self.mode = None
 
     async def _close_session(self) -> None:
         """Stop whatever is running and save the current session (feedback in progress keeps going)."""
@@ -483,7 +440,7 @@ class Session:
     # ---------- chat / interview turns ----------
 
     async def _greet(self) -> None:
-        """Kira's opening line in a new chat. It is shown, not spoken, and it primes FLM's prompt cache
+        """The assistant's opening line in a new chat. It is shown, not spoken, and it primes FLM's prompt cache
         with the system prompt, so the user's first turn is as fast as the later ones."""
         await self.models.ensure("stt", "tts", "llm")
         self._refresh_chat_prompt()
@@ -496,7 +453,7 @@ class Session:
         try:
             async with asyncio.timeout(self.cfg.chat.timeout_s):
                 async with contextlib.aclosing(self.models.llm_events(
-                        self._wire(), tools=self._tool_schemas(), think=False, temperature=self.cfg.chat.temperature,
+                        self.history, tools=self._tool_schemas(), think=False, temperature=self.cfg.chat.temperature,
                         max_tokens=60)) as events:
                   async for ev in events:
                     if ev["type"] == "content":
@@ -516,7 +473,7 @@ class Session:
         if s["notes_query"]:
             background = await self._notes(f"{self.details} {s['notes_query']}", 4, 2000)
         self.history = [{"role": "system", "content": self.coach.roleplay_system_prompt(
-                            self.scenario, self.details, background, self.cfg.persona.name)},
+                            self.scenario, self.details, background, self.svc.persona.name)},
                         {"role": "user", "content": self.coach.KICKOFF}]
         self.history_prefix = 2
         await self.models.ensure("stt", "tts", "llm")
@@ -536,15 +493,6 @@ class Session:
         self._refresh_chat_prompt()
         t_end = time.perf_counter()
         audio_s = round(pcm_seconds(pcm), 2)
-        hearing = self._hearing() if audio_s <= AUDIO_MAX_S else "text"
-        if hearing == "heard":
-            msg = {"role": "user", "content": [audio_part(pcm)], "_audio_s": audio_s}
-            if live:
-                live.cancel()
-            self.history.append(msg)
-            self._trim_history()
-            self.timeline_s += audio_s
-            return await self._reply(t_end, tools=True, heard=Heard(msg, pcm))
         self._state("transcribing")
         text = await self._transcript(pcm, live)
         stt_ms = round((time.perf_counter() - t_end) * 1000)
@@ -557,11 +505,7 @@ class Session:
             self.answers.append(Answer(text, analysis, self.timeline_s))
             self._save_audio(pcm, f"{self.session_id}-{len(self.answers):02d}")
         self.timeline_s += audio_s
-        if hearing == "audio":   # the model hears the recording; Whisper's words are for the bubble and the router
-            self.history.append({"role": "user", "content": [audio_part(pcm)], "_audio_s": audio_s,
-                                 "_transcript": text})
-        else:
-            self.history.append({"role": "user", "content": text})
+        self.history.append({"role": "user", "content": text})
         self._trim_history()
         routed = route(text, self.svc.tools, self.svc.tool_ctx) if self.mode == "chat" and self._tool_schemas() else []
         await self._reply(t_end, tools=self.mode == "chat", routed=routed)
@@ -572,16 +516,13 @@ class Session:
 
     def _trim_history(self) -> None:
         """Drop the oldest exchanges once over budget. Trimming changes the prompt prefix, so FLM has to
-        re-read the whole conversation once; cutting a third at a time keeps that rare. Recordings still
-        in the history become their transcripts then, which shrinks the context a lot."""
+        re-read the whole conversation once; cutting a third at a time keeps that rare."""
         budget = self.cfg.chat.history_word_budget
 
         def size() -> int:
-            return sum(int(m.get("_audio_s", 0) * AUDIO_WORDS_PER_S) if isinstance(m.get("content"), list)
-                       else len(str(m.get("content") or "").split()) for m in self.history[self.history_prefix:])
+            return sum(len(str(m.get("content") or "").split()) for m in self.history[self.history_prefix:])
         if size() <= budget:
             return
-        self._audio_to_text(keep_last=True)
         while size() > budget * 2 // 3 and len(self.history) > self.history_prefix + 2:
             # Remove one whole exchange: something the user said and everything up to the next thing they said.
             end = self.history_prefix + 1
@@ -591,49 +532,23 @@ class Session:
 
     @staticmethod
     def _said_by_user(msg: dict) -> bool:
-        content = msg.get("content")
-        if isinstance(content, list):
-            return msg["role"] == "user"
-        content = str(content or "")
+        content = str(msg.get("content") or "")
         return msg["role"] == "user" and not content.startswith(RESULTS_PREFIX) and content != NUDGE
 
     def _tool_schemas(self) -> list[dict] | None:
         return self.svc.tools.schemas() if self.mode == "chat" and self.svc.tools else None
 
-    # ---------- the user's words for an audio turn ----------
+    # ---------- the assistant's reply ----------
 
-    def _words_known(self, heard: Heard, text: str | None, source: str) -> None:
-        """The user's words for a "heard" turn are in: show them, save them, and route them."""
-        heard.known, heard.text = True, (text or "").strip() or None
-        heard.msg["_transcript"] = heard.text
-        self.send({"type": "user_text", "text": heard.text or "(couldn't transcribe that)", "source": source})
-        if heard.text:
-            self.store.add_turn(self.session_id, "user", heard.text, heard.msg.get("_audio_s"))
-            heard.routed = route(heard.text, self.svc.tools, self.svc.tool_ctx) if self._tool_schemas() else []
-
-    async def _settle(self, heard: Heard) -> None:
-        """No <heard> block: Whisper transcribes the turn (after the model's stream, as the NPU is free then)."""
-        if heard.known:
-            return
-        text = None
-        try:
-            text = await self.models.transcribe(heard.pcm)
-        except LemonadeError as e:
-            log.warning("no transcript for an audio turn: %s", e)
-        self._words_known(heard, text, "whisper")
-
-    # ---------- Kira's reply ----------
-
-    async def _reply(self, t_ref: float, tools: bool = True, heard: Heard | None = None,
-                     routed: list[ToolCall] = ()) -> None:
-        """Stream Kira's reply and speak it clause by clause while it is still being written. If the model
+    async def _reply(self, t_ref: float, tools: bool = True, routed: list[ToolCall] = ()) -> None:
+        """Stream the assistant's reply and speak it clause by clause while it is still being written. If the model
         calls tools, say a short filler line, run them, and let the model continue with the results."""
         self.reply_id += 1
         rid = self.reply_id
         self._state("thinking")
         self.send({"type": "reply_start", "id": rid})
         timing: dict = {}
-        shown: list[str] = []     # everything Kira wrote this turn (all rounds)
+        shown: list[str] = []     # everything the assistant wrote this turn (all rounds)
         spoken: list[str] = []
         meta: dict = {"tools": [], "sources": []}
         pieces: asyncio.Queue = asyncio.Queue()
@@ -649,14 +564,12 @@ class Session:
         speaker_task = asyncio.create_task(speaker())
         interrupted, final = True, ""
         try:
-            final = await self._agent_loop(rid, pieces, timing, t_ref, shown, meta, tools, heard, list(routed))
+            final = await self._agent_loop(rid, pieces, timing, t_ref, shown, meta, tools, list(routed))
             pieces.put_nowait(None)
             await speaker_task
             interrupted = False
         finally:
             speaker_task.cancel()
-            if heard and not heard.known:
-                asyncio.create_task(self._settle(heard))   # the bubble still gets its words
             if interrupted:
                 text = strip_emoji(" ".join(spoken))
                 if final:   # the answer was complete but cut off while speaking: keep what was heard
@@ -675,7 +588,7 @@ class Session:
                 self._state("idle")
 
     async def _agent_loop(self, rid: int, pieces: asyncio.Queue, timing: dict, t_ref: float, shown: list[str],
-                          meta: dict, tools_on: bool, heard: Heard | None, routed: list[ToolCall]) -> str:
+                          meta: dict, tools_on: bool, routed: list[ToolCall]) -> str:
         """LLM rounds until the model answers without calling a tool. Returns the final answer text
         (already appended to the history)."""
         cap = self.cfg.tools.max_calls_per_turn
@@ -687,15 +600,9 @@ class Session:
             # so it answers from the results in one round.
             used += len(routed)
             await self._tool_round(rid, routed, "", "", pieces, meta, timing, t_ref)
-        for i in range(cap + 3):
-            rnd = await self._llm_round(rid, pieces, timing, t_ref, shown, schemas, heard if i == 0 else None)
-            calls: list[ToolCall] = []
-            if schemas and rnd.stopped:
-                calls = rnd.stopped
-            elif schemas and rnd.calls:
-                calls = [registry.parse(c) for c in rnd.calls]
-                if i == 0 and heard:
-                    calls += missing(heard.routed, calls)
+        for _ in range(cap + 3):
+            rnd = await self._llm_round(rid, pieces, timing, t_ref, shown, schemas)
+            calls = [registry.parse(c) for c in rnd.calls] if schemas else []
             if calls:
                 if used >= cap:
                     # Over the limit: answer every call with an error so the history stays valid.
@@ -748,33 +655,15 @@ class Session:
         self.history.append(registry.results_message(calls, results))
 
     async def _llm_round(self, rid: int, pieces: asyncio.Queue, timing: dict, t_ref: float, shown: list[str],
-                         schemas: list[dict] | None, heard: Heard | None = None) -> Round:
-        """One streamed LLM request, shown and spoken as it's written. In "heard" mode the first round's
-        <heard> block is taken off the reply (the user's words), and routed: if the model then starts answering
-        without a tool the request clearly needs, the answer is stopped before a word of it is spoken."""
+                         schemas: list[dict] | None) -> Round:
+        """One streamed LLM request, shown and spoken as it's written."""
         chunker = SpeechChunker()
         rnd = Round()
         raw: list[str] = []
         content: list[str] = []
-        head = ""               # the start of the reply while looking for a <heard> block
-        parse_heard = heard is not None and not heard.parsed
-        # In "heard" mode a later round (after tool results) may open with a transcript again: drop it.
-        head_done = not (parse_heard or (heard is None and self._hearing() == "heard"))
         gap = bool("".join(shown).strip())   # separate this round's text from the previous round's
 
-        def release(delta: str) -> None:
-            if not content and not delta.strip():
-                return
-            if "llm_first_token_ms" not in timing:
-                timing["llm_first_token_ms"] = round((time.perf_counter() - t_ref) * 1000)
-            if gap and not content:
-                delta = " " + delta.lstrip()
-            content.append(delta)
-            self.send({"type": "reply_delta", "id": rid, "text": delta})
-            for piece in chunker.feed(delta):
-                pieces.put_nowait(piece)
-
-        stream = self.models.llm_events(self._wire(), tools=schemas, think=False, temperature=self.cfg.chat.temperature,
+        stream = self.models.llm_events(self.history, tools=schemas, think=False, temperature=self.cfg.chat.temperature,
                                         max_tokens=self.cfg.chat.max_tokens)
         try:
             async with asyncio.timeout(self.cfg.chat.timeout_s):
@@ -785,37 +674,22 @@ class Session:
                         continue
                     delta = ev["text"]
                     raw.append(delta)
-                    if not head_done:
-                        head += delta
-                        status, words_, rest = split_heard(head)
-                        if status == "wait":
-                            continue
-                        head_done = True
-                        if parse_heard:
-                            heard.parsed = True
-                            if status == "done":
-                                self._words_known(heard, words_, "heard")
-                            # else: no <heard> block; Whisper transcribes after this stream (no routing then)
-                        delta = rest
-                    if heard and heard.known and delta.strip() and missing(heard.routed, []):
-                        # It's answering without the tools this request clearly needs: stop before it's spoken.
-                        rnd.stopped = missing(heard.routed, [])
-                        break
-                    release(delta)
+                    if not content and not delta.strip():
+                        continue
+                    if "llm_first_token_ms" not in timing:
+                        timing["llm_first_token_ms"] = round((time.perf_counter() - t_ref) * 1000)
+                    if gap and not content:
+                        delta = " " + delta.lstrip()
+                    content.append(delta)
+                    self.send({"type": "reply_delta", "id": rid, "text": delta})
+                    for piece in chunker.feed(delta):
+                        pieces.put_nowait(piece)
         finally:
             await stream.aclose()       # releases the NPU (FLM stops when the client disconnects)
-        if heard and not heard.known and rnd.calls:
-            # A tool call with no transcript before it: get the words now, so routed calls can still join.
-            heard.parsed = True
-            await self._settle(heard)
-        if not rnd.stopped:
-            for piece in chunker.flush():
-                pieces.put_nowait(piece)
+        for piece in chunker.flush():
+            pieces.put_nowait(piece)
         rnd.raw = "".join(raw)
-        rnd.text = "".join(content) if not rnd.stopped else ""
-        if rnd.stopped:
-            m = re.match(r"\s*<heard>.*?</heard>", rnd.raw, re.S)
-            rnd.raw = m.group(0).strip() if m else ""   # keep the transcript, drop the cut-off answer
+        rnd.text = "".join(content)
         if rnd.text.strip():
             shown.append(rnd.text)
         return rnd
@@ -866,7 +740,7 @@ class Session:
     # ---------- asking permission ----------
 
     async def _ask_permission(self, rid: int, call: ToolCall, tool, pieces: asyncio.Queue) -> bool:
-        """Kira asks before a tool that changes something; the user answers by voice or with the buttons.
+        """The assistant asks before a tool that changes something; the user answers by voice or with the buttons.
         No answer within skills.confirm_timeout_s counts as no."""
         question = tool.confirm_text(call.args)
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
@@ -891,7 +765,7 @@ class Session:
             self.pending_confirm[1].set_result(allow)
 
     async def _confirm_answer(self, pcm: bytes) -> None:
-        """A spoken answer to Kira's yes/no question (Whisper + a pattern, no LLM call)."""
+        """A spoken answer to the assistant's yes/no question (Whisper + a pattern, no LLM call)."""
         if not has_speech(pcm):
             return self._notice("I didn't hear anything. Say yes or no, or use the buttons.")
         text = await self.models.transcribe(pcm)
@@ -1044,7 +918,7 @@ class Session:
         self.send({"type": "feedback_status", "text": "started", "model": model})
         parts: list[str] = []
         messages = coach.feedback_messages(kind, transcript, metrics, scenario, details, talking_points,
-                                           persona=self.cfg.persona.name)
+                                           persona=self.svc.persona.name)
         async with contextlib.aclosing(self.models.llm_text(messages, think=think,
                                                             temperature=self.cfg.feedback.temperature,
                                                             max_tokens=self.cfg.feedback.max_tokens)) as text:

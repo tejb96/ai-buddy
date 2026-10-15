@@ -65,21 +65,16 @@ class FakeModels:
     """Like ModelManager: the LLM and Whisper share the NPU, so `overlaps` counts Whisper calls made while an
     LLM stream was open (there must be none)."""
 
-    def __init__(self, lm: FakeLM, transcripts: list[str] | None = None, hears_audio: bool = False,
-                 delay: float = 0.01):
+    def __init__(self, lm: FakeLM, transcripts: list[str] | None = None, delay: float = 0.01):
         self.lm = lm
         self.names = {"stt": "whisper", "llm": "gemma", "tts": "kokoro"}
         self.state = {r: "ready" for r in self.names}
         self.voice = "af_heart"
         self.transcripts = list(transcripts or [])
-        self.audio = hears_audio
         self.delay = delay
         self.transcribed = 0
         self.streaming = 0
         self.overlaps = 0
-
-    def hears_audio(self) -> bool:
-        return self.audio
 
     async def ensure(self, *roles):
         pass
@@ -164,11 +159,10 @@ class SaveNote(Tool):
         return ToolResult({"saved": args["text"]}, summary="Saved")
 
 
-def make_session(tmp_path: Path, replies=None, transcripts=None, hears_audio=False, transcript="whisper",
-                 skills=("clock", "calculator", "speaking-coach"), extra_tools=()) -> tuple[Session, FakeLM, FakeModels]:
+def make_session(tmp_path: Path, replies=None, transcripts=None, skills=("clock", "calculator", "speaking-coach"),
+                 extra_tools=()) -> tuple[Session, FakeLM, FakeModels]:
     cfg = load_config()
     cfg.chat.greet = False
-    cfg.chat.transcript = transcript
     cfg.skills.confirm_timeout_s = 2
     found = discover()
     for tool in extra_tools:
@@ -177,8 +171,8 @@ def make_session(tmp_path: Path, replies=None, transcripts=None, hears_audio=Fal
     names = list(skills) + [f"test-{t.name.replace('_', '-')}" for t in extra_tools]
     skillset = SkillSet(found, names)
     lm = FakeLM(replies)
-    models = FakeModels(lm, transcripts, hears_audio)
-    store = Store(tmp_path, cfg.persona.name, found["speaking-coach"].modules["modes"].SCENARIOS)
+    models = FakeModels(lm, transcripts)
+    store = Store(tmp_path, "Bella", found["speaking-coach"].modules["modes"].SCENARIOS)
     svc = Services(cfg, lm, models, store, skillset, ToolContext(cfg, None, None, "America/Edmonton"), None)
     skillset.on_change(svc.skills_changed)
     return Session(FakeWS(), svc), lm, models

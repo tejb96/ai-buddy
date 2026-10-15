@@ -15,7 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ai_buddy.config import load_config  # noqa: E402
 from ai_buddy.lemonade import Lemonade, LemonadeError  # noqa: E402
-from ai_buddy.prompts import chat_system_prompt  # noqa: E402
+from ai_buddy.prompts import Persona, chat_system_prompt  # noqa: E402
 from ai_buddy.tools import ToolRegistry  # noqa: E402
 
 SPOKEN = "Hey Kira, what's a good name for a grey cat?"
@@ -64,7 +64,7 @@ async def main() -> int:
         check(r.status_code == 200 and len(r.content) > 10000, "text-to-speech")
         heard = await lm.transcribe(to_wav16k(r.content), m.stt)
         check("cat" in heard.lower(), "speech-to-text", repr(heard))
-        system = {"role": "system", "content": chat_system_prompt(cfg.persona, "UTC")}
+        system = {"role": "system", "content": chat_system_prompt(Persona.of(cfg), "UTC")}
         reply = await lm.chat(m.llm, [system, {"role": "user", "content": heard or SPOKEN}], think=False,
                               temperature=0.3, max_tokens=120)
         check(len(reply.split()) >= 3 and "<think" not in reply, "spoken reply", repr(reply[:120]))

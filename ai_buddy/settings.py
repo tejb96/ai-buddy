@@ -1,4 +1,4 @@
-"""Choices made in the UI (voice, model, knowledge folder, which skills are on), saved in
+"""Choices made in the UI (voice, models, knowledge folder, which skills are on), saved in
 <data_dir>/settings.json.
 
 They start from config.toml and override it once changed in the settings panel.
@@ -16,10 +16,11 @@ from .config import Config
 
 log = logging.getLogger(__name__)
 
-# Kokoro voices worth offering (the best-rated English ones), in display order.
+# Kokoro voices worth offering (the best-rated English ones), in display order. The assistant is named after
+# the voice: the first word of its label (Bella by default).
 VOICES: dict[str, str] = {
-    "af_heart": "Heart (American, female)",
     "af_bella": "Bella (American, female)",
+    "af_heart": "Heart (American, female)",
     "af_nicole": "Nicole (American, female, soft)",
     "af_sarah": "Sarah (American, female)",
     "bf_emma": "Emma (British, female)",
@@ -30,13 +31,22 @@ VOICES: dict[str, str] = {
 }
 
 
+
+def voice_name(voice: str) -> str:
+    """The assistant's name for a Kokoro voice: "af_bella" -> "Bella" (also for voices not listed above)."""
+    label = VOICES.get(voice)
+    return label.split(" (")[0] if label else voice.split("_", 1)[-1].replace("_", " ").title()
+
+
 class Settings:
-    KEYS = ("voice", "llm", "knowledge_folder")
+    KEYS = ("voice", "llm", "stt", "knowledge_folder")
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.path = cfg.app.data_path / "settings.json"
-        self.values = {"voice": cfg.voice.tts_voice, "llm": cfg.models.llm, "knowledge_folder": cfg.rag.folder}
+        self.defaults = {"voice": cfg.voice.tts_voice, "llm": cfg.models.llm, "stt": cfg.models.stt,
+                         "knowledge_folder": cfg.rag.folder}
+        self.values = dict(self.defaults)
         self.skills: dict[str, bool] = {}    # skill switches flipped in the app (override skills.enabled)
         self._listeners: list[Callable[[str, str], None]] = []
         try:
@@ -56,6 +66,10 @@ class Settings:
     @property
     def llm(self) -> str:
         return self.values["llm"]
+
+    @property
+    def stt(self) -> str:
+        return self.values["stt"]
 
     @property
     def knowledge_folder(self) -> Path | None:
@@ -80,7 +94,9 @@ class Settings:
         self._save()
 
     def _save(self) -> None:
+        """Only choices that differ from config.toml are saved, so a new default there still applies."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({**self.values, "skills": self.skills}, indent=2))
+        chosen = {k: v for k, v in self.values.items() if v != self.defaults[k]}
+        tmp.write_text(json.dumps({**chosen, "skills": self.skills}, indent=2))
         tmp.replace(self.path)

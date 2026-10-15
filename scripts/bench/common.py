@@ -19,6 +19,23 @@ CACHE.mkdir(exist_ok=True)
 http = httpx.Client(base_url=BASE, timeout=httpx.Timeout(10.0, read=600))
 
 
+# How the user's words reached the model in the audio-input pipelines (Gemma 4 hearing the recording), which
+# the app used until 2026-10-14. The app now always sends Whisper's text (ai_buddy.prompts.HEARING).
+AUDIO_HEARING = {
+    "audio": "You hear the user's voice directly.",
+    "heard": ("You hear the user's voice directly. Begin every reply to a voice message with a verbatim transcript of "
+              "it inside <heard></heard> tags: every word exactly as spoken, including filler words (um, uh, like, you "
+              "know), false starts and repeated words, with normal punctuation; don't correct anything. Then reply. "
+              "When you call a tool, write the <heard> transcript first."),
+}
+
+
+def hearing(system: str, kind: str) -> str:
+    """A chat prompt for an audio-input pipeline ("audio" or "heard"); "text"/"whisper" leaves it as it is."""
+    from ai_buddy.prompts import HEARING
+    return system.replace(HEARING, AUDIO_HEARING[kind]) if kind in AUDIO_HEARING else system
+
+
 def synth(text: str, voice: str = "am_michael", speed: float = 1.0) -> bytes:
     """Kokoro speech for `text` as 16 kHz mono PCM16 (cached on disk)."""
     key = re.sub(r"[^a-z0-9]+", "_", f"{voice}_{speed}_{text.lower()}")[:120] + f"_{abs(hash(text)) % 10**8}"

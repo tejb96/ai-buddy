@@ -69,6 +69,12 @@ class Lemonade:
     async def unload(self, model: str) -> None:
         await self._http.post("/unload", json={"model_name": model}, timeout=60)
 
+    async def unload_all(self) -> None:
+        """Unload every loaded model (an empty request body means all of them)."""
+        r = await self._http.post("/unload", json={}, timeout=60)
+        if r.status_code != 200:
+            raise LemonadeError(f"Unloading the models failed ({r.status_code}): {r.text[:300]}")
+
     # ---------- LLM ----------
 
     async def chat_events(self, model: str, messages: list[dict], *, tools: list[dict] | None = None,

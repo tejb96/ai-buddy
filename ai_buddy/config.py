@@ -20,16 +20,19 @@ class LemonadeCfg:
 @dataclass
 class ModelsCfg:
     stt: str = "whisper-v3-turbo-FLM"
-    llm: str = "gemma4-it-12b-FLM"
+    llm: str = "qwen3.5-9b-FLM"
     tts: str = "kokoro-v1"
+    # Speech-to-text models offered in the settings panel, and the whisper.cpp backend for the non-FLM ones.
+    stt_choices: list[str] = field(default_factory=lambda: ["whisper-v3-turbo-FLM", "Whisper-Large-v3-Turbo"])
+    stt_backend: str = "cpu"
     llm_ctx_size: int = 32768
     # Embedding model for note search (llama.cpp on the CPU), e.g. "Qwen3-Embedding-0.6B-GGUF"; "" = keywords only.
     embed: str = ""
     embed_backend: str = "cpu"          # llama.cpp backend for the embedding model
     embed_threads: int = 4              # CPU threads for it (leaves cores for Kokoro)
     # LLMs offered in the settings panel.
-    llm_choices: list[str] = field(default_factory=lambda: ["gemma4-it-12b-FLM", "qwen3.6-moe-35b-a3b-FLM",
-                                                            "qwen3-it-4b-FLM"])
+    llm_choices: list[str] = field(default_factory=lambda: ["qwen3.5-9b-FLM", "gemma4-it-12b-FLM",
+                                                            "qwen3.6-moe-35b-a3b-FLM"])
 
 
 @dataclass
@@ -40,11 +43,6 @@ class ChatCfg:
     history_word_budget: int = 8000
     greet: bool = True
     timeout_s: float = 90
-    # Send the recording itself to an LLM that hears audio (Lemonade label "audio"); otherwise Whisper's text.
-    audio_input: bool = True
-    # Where the chat bubble's transcript comes from with audio input: "heard" (the LLM writes it before
-    # replying) or "whisper" (Whisper transcribes alongside). Practice modes always use Whisper.
-    transcript: str = "whisper"
 
 
 @dataclass
@@ -64,20 +62,20 @@ class SttCfg:
 
 @dataclass
 class VoiceCfg:
-    tts_voice: str = "af_heart"
+    tts_voice: str = "af_bella"         # the assistant is named after the voice: Bella
     tts_speed: float = 1.0
     language: str = "en"
 
 
 @dataclass
 class PersonaCfg:
-    name: str = "Kira"
+    # The assistant's name is the voice's name (Bella, Emma, George...), so it changes with the voice.
     style: str = "warm, encouraging and honest"
 
 
 @dataclass
 class UserCfg:
-    location: str = ""      # e.g. "Calgary, Alberta": Kira assumes it when you don't name a place
+    location: str = ""      # e.g. "Calgary, Alberta": assumed when you don't name a place
 
 
 @dataclass
@@ -85,7 +83,7 @@ class SkillsCfg:
     enabled: list[str] = field(default_factory=lambda: ["web-search", "notes", "clock", "calculator",
                                                         "speaking-coach"])
     dirs: list[str] = field(default_factory=list)     # folders with your own skills
-    confirm_timeout_s: float = 60                      # how long Kira waits for a yes/no before an action
+    confirm_timeout_s: float = 60                      # how long to wait for a yes/no before an action
 
 
 @dataclass
@@ -173,14 +171,18 @@ class Config:
     app: AppCfg = field(default_factory=AppCfg)
 
 
-_MOVED = {("ToolsCfg", "enabled"): "skills.enabled (skills are named web-search, notes, clock, calculator...)",
-          ("ToolsCfg", "plugin_dir"): "skills.dirs (a tool plugin is now a skill folder with SKILL.md and tools.py)"}
+_MOVED = {("ToolsCfg", "enabled"): "[tools] enabled has moved to skills.enabled (skills are named web-search, notes, "
+                                   "clock, calculator...)",
+          ("ToolsCfg", "plugin_dir"): "[tools] plugin_dir has moved to skills.dirs (a tool plugin is now a skill folder "
+                                      "with SKILL.md and tools.py)",
+          ("PersonaCfg", "name"): "[persona] name is gone: the assistant is named after its voice ([voice] tts_voice, "
+                                  "or pick one in the app)"}
 
 
 def _build(cls, values: dict):
-    for (owner, key), where in _MOVED.items():
+    for (owner, key), message in _MOVED.items():
         if cls.__name__ == owner and key in values:
-            raise ValueError(f"[tools] {key} has moved to {where}")
+            raise ValueError(message)
     known = {f.name for f in fields(cls)}
     unknown = set(values) - known
     if unknown:

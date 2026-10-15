@@ -35,7 +35,7 @@ def launch_window(url: str, profile_dir: str) -> subprocess.Popen | None:
     return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def open_window(url: str, profile_dir: str, server: uvicorn.Server) -> None:
+def open_window(url: str, profile_dir: str, server: uvicorn.Server, window: dict) -> None:
     """Open the app window once the server is up; stop the server when that window is closed."""
     while not server.started:
         time.sleep(0.1)
@@ -43,6 +43,7 @@ def open_window(url: str, profile_dir: str, server: uvicorn.Server) -> None:
     proc = launch_window(url, profile_dir)
     if proc is None:
         return
+    window["proc"] = proc
     proc.wait()
     # Chrome hands off to an already-open window of this profile and exits at once; only a
     # window that stayed open for a while means the user closed the app.
@@ -85,13 +86,26 @@ def main() -> None:
             launch_window(url, str(cfg.app.data_path / "chrome-profile"))
         return
 
-    server = uvicorn.Server(uvicorn.Config(create_app(cfg), host=cfg.app.host, port=cfg.app.port,
+    server: uvicorn.Server | None = None
+
+    def shutdown() -> None:         # the app's Exit button
+        server.should_exit = True
+
+    server = uvicorn.Server(uvicorn.Config(create_app(cfg, shutdown), host=cfg.app.host, port=cfg.app.port,
                                            log_level="warning", ws_max_size=4 * 1024 * 1024))
+    window: dict = {}
     if cfg.app.open_window and not args.no_window:
         profile = str(cfg.app.data_path / "chrome-profile")
-        threading.Thread(target=open_window, args=(url, profile, server), daemon=True).start()
+        threading.Thread(target=open_window, args=(url, profile, server, window), daemon=True).start()
     print(f"AI Buddy running at {url}  (Ctrl+C to quit)", flush=True)
     server.run()
+    proc = window.get("proc")
+    if proc and proc.poll() is None:
+        proc.terminate()            # close the app window we opened (Exit, or Ctrl+C in the terminal)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
 
 
 if __name__ == "__main__":

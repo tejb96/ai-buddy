@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # the repo root
 from ai_buddy.config import load_config  # noqa: E402
-from ai_buddy.prompts import chat_system_prompt  # noqa: E402
+from ai_buddy.prompts import Persona, chat_system_prompt  # noqa: E402
 from ai_buddy.skills import SkillSet  # noqa: E402
 
 from common import http, load  # noqa: E402
@@ -43,7 +43,7 @@ def ask(messages, tool_choice=None, max_tokens=60):
 
 if __name__ == "__main__":
     load(LLM, ctx_size=CFG.models.llm_ctx_size)
-    system = {"role": "system", "content": f"[{time.time_ns()}] " + chat_system_prompt(CFG.persona, "America/Edmonton",
+    system = {"role": "system", "content": f"[{time.time_ns()}] " + chat_system_prompt(Persona.of(CFG), "America/Edmonton",
                                                                           SKILLS.chat_instructions())}
     joke = [system, {"role": "user", "content": "Tell me a joke about cats."}]
     print("baseline (no tool_choice):", ask(joke))

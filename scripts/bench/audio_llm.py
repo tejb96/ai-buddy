@@ -25,10 +25,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # the repo root
 from ai_buddy.config import load_config  # noqa: E402
 from ai_buddy.metrics import count_fillers  # noqa: E402
-from ai_buddy.prompts import HEARING, chat_system_prompt  # noqa: E402
+from ai_buddy.prompts import Persona, chat_system_prompt  # noqa: E402
 from ai_buddy.skills import SkillSet  # noqa: E402
 
-from common import ThermalLog, add_noise, dump, http, load, loaded, norm, silence, synth, transcribe, wav, wer  # noqa: E402
+from common import (AUDIO_HEARING, ThermalLog, add_noise, dump, hearing, http, load, loaded, norm, silence,  # noqa: E402
+                    synth, transcribe, wav, wer)
 _argv, sys.argv = sys.argv, sys.argv[:1]   # llm_bench reads its own arguments at import
 from llm_bench import TOOL_CASES  # noqa: E402
 sys.argv = _argv
@@ -52,9 +53,10 @@ CFG = load_config()
 SKILLS = SkillSet.from_config(CFG)
 REG = SKILLS.registry()
 # Kira's real chat prompt (as of this commit; runs before 2026-10-14 used the pre-skills prompt).
-SYSTEM = chat_system_prompt(CFG.persona, "America/Edmonton", SKILLS.chat_instructions(),
-                            {"whisper": "text", "audio": "audio", "heard": "heard"}[KIND])
-HEARD_RULE = HEARING["heard"]
+# The test prompts call the assistant Kira (its name until 2026-10-14; now it is named after its voice).
+SYSTEM = hearing(chat_system_prompt(Persona("Kira", CFG.persona.style), "America/Edmonton",
+                                    SKILLS.chat_instructions()), KIND)
+HEARD_RULE = AUDIO_HEARING["heard"]
 LS_N = int(os.environ.get("LS_N", "30"))     # LibriSpeech clips in the heard section
 
 

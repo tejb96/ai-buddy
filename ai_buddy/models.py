@@ -1,14 +1,15 @@
 """Keep the right models loaded in Lemonade and report their state to the UI.
 
 One LLM does everything: conversation, tool calls and coaching, so nothing is swapped. Whisper
-(speech-to-text) runs in its own FLM process on the NPU and Kokoro (TTS) on the CPU. The embedding model
-for note search runs on llama.cpp's CPU backend and is loaded the first time the notes need it. Models are
-loaded explicitly so our options apply (an implicit load would use Lemonade's defaults: a 64k context, and
-whatever llama.cpp backend is the default).
+(speech-to-text) runs in its own FLM process on the NPU (or, as an option, Whisper Large v3 Turbo on
+whisper.cpp, on the CPU by default) and Kokoro (TTS) on the CPU. The embedding model for note search runs on
+llama.cpp's CPU backend and is loaded the first time the notes need it. Models are loaded explicitly so our
+options apply (an implicit load would use Lemonade's defaults: a 64k context, and whatever llama.cpp or
+whisper.cpp backend is the default).
 
 One NPU job at a time: when Whisper and the LLM (two FLM processes) run at the same moment, both results come
 back corrupted (an empty reply after a minute, "What? What? What?" from Whisper; FLM 1.0.6). Loaded side by
-side they're fine. So every Whisper call and every LLM stream goes through one lock, and LLM streams are
+side they're fine. So every FLM Whisper call and every LLM stream goes through one lock, and LLM streams are
 always closed when abandoned (FLM stops generating as soon as the client disconnects).
 """
 
@@ -30,18 +31,24 @@ log = logging.getLogger(__name__)
 ROLES = ("stt", "llm", "tts")      # what a conversation needs; "embed" (notes) is loaded on demand
 
 
+def on_npu(model: str) -> bool:
+    """FLM models (Lemonade names them "...-FLM") run on the NPU; the others on the CPU (or a GPU backend)."""
+    return model.endswith("-FLM")
+
+
 class ModelManager:
-    def __init__(self, lm: Lemonade, cfg: Config, llm: str | None = None, voice: str | None = None):
+    def __init__(self, lm: Lemonade, cfg: Config, llm: str | None = None, voice: str | None = None,
+                 stt: str | None = None):
         self.lm = lm
         self.cfg = cfg
-        self.names = {"stt": cfg.models.stt, "llm": llm or cfg.models.llm, "tts": cfg.models.tts}
+        self.names = {"stt": stt or cfg.models.stt, "llm": llm or cfg.models.llm, "tts": cfg.models.tts}
         if cfg.models.embed:
             self.names["embed"] = cfg.models.embed
         self.voice = voice or cfg.voice.tts_voice
         self.state = {r: "unknown" for r in self.names}
-        self.labels: dict[str, list[str]] = {}       # model -> Lemonade labels, filled by refresh_labels()
         self.error: str | None = None
         self.warm = False
+        self.closed = False             # the app is exiting: load nothing more
         self._lock = asyncio.Lock()
         self._npu = asyncio.Lock()      # one FLM job (Whisper or LLM) at a time
         self._listeners: set[Callable[[dict], None]] = set()
@@ -49,18 +56,9 @@ class ModelManager:
     # ---------- status ----------
 
     def snapshot(self) -> dict:
-        return {"models": {r: {"name": self.names[r], "state": self.state[r]} for r in self.names},
-                "error": self.error, "warm": self.warm, "hears_audio": self.hears_audio()}
-
-    async def refresh_labels(self) -> None:
-        try:
-            self.labels = {k: v.get("labels") or [] for k, v in (await self.lm.models()).items()}
-        except (LemonadeError, httpx.HTTPError) as e:
-            log.warning("couldn't read Lemonade's model list: %s", e)
-
-    def hears_audio(self) -> bool:
-        """Whether the chat LLM takes audio input (gemma4 models) and the config wants it used."""
-        return self.cfg.chat.audio_input and "audio" in self.labels.get(self.names["llm"], [])
+        return {"models": {r: {"name": self.names[r], "state": self.state[r], "device": self.device(r)}
+                           for r in self.names},
+                "error": self.error, "warm": self.warm}
 
     def subscribe(self, fn: Callable[[dict], None]) -> None:
         self._listeners.add(fn)
@@ -99,6 +97,8 @@ class ModelManager:
 
     async def ensure(self, *roles: str) -> None:
         """Make sure the models for `roles` are loaded (cheap when they already are)."""
+        if self.closed:
+            raise LemonadeError("The app is shutting down.")
         roles = roles or ROLES
         loaded = await self.refresh()
         if all(self.names[r] in loaded for r in roles):
@@ -121,10 +121,20 @@ class ModelManager:
                 loaded = await self.refresh()
 
     def _options(self, role: str) -> dict:
-        if role != "embed":
-            return {}
         m = self.cfg.models
-        return {"llamacpp_backend": m.embed_backend, "llamacpp_args": f"--threads {m.embed_threads}"}
+        if role == "embed":
+            return {"llamacpp_backend": m.embed_backend, "llamacpp_args": f"--threads {m.embed_threads}"}
+        if role == "stt" and not on_npu(self.names["stt"]):
+            return {"whispercpp_backend": m.stt_backend}
+        return {}
+
+    def device(self, role: str) -> str:
+        """Where a role's model runs, for the UI: "NPU", "CPU" or "GPU"."""
+        name = self.names.get(role, "")
+        if on_npu(name):
+            return "NPU"
+        backend = {"stt": self.cfg.models.stt_backend, "embed": self.cfg.models.embed_backend}.get(role, "cpu")
+        return "CPU" if backend == "cpu" else "GPU"
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         """Embeddings for note search (loads the embedding model on the CPU first if needed)."""
@@ -133,7 +143,6 @@ class ModelManager:
 
     async def prepare_live(self) -> None:
         """Load and warm up everything a conversation needs."""
-        await self.refresh_labels()
         await self.ensure("stt", "tts", "llm")
         await self.warm_up()
         self.warm = True
@@ -150,10 +159,26 @@ class ModelManager:
 
     def switch_llm(self, name: str) -> asyncio.Task:
         """Use a different LLM from now on (loading it evicts the old one)."""
-        self.names["llm"] = name
-        self.state["llm"] = "standby"
+        return self._switch("llm", name)
+
+    def switch_stt(self, name: str) -> asyncio.Task:
+        """Use a different speech-to-text model from now on (Lemonade keeps one loaded, so the old one goes)."""
+        return self._switch("stt", name)
+
+    def _switch(self, role: str, name: str) -> asyncio.Task:
+        self.names[role] = name
+        self.state[role] = "standby"
         self._notify()
-        return self.ensure_in_background("llm")
+        return self.ensure_in_background(role)
+
+    async def unload_all(self) -> None:
+        """Exit: unload every model from Lemonade (not just ours), and load nothing more."""
+        self.closed = True
+        await self.lm.unload_all()
+        for role in self.names:
+            self.state[role] = "standby"
+        self.warm = False
+        self._notify()
 
     async def llm_events(self, messages: list[dict], **kw) -> AsyncIterator[dict]:
         """The chat LLM's streamed events (see Lemonade.chat_events), holding the NPU while it runs.
@@ -170,10 +195,10 @@ class ModelManager:
                     yield ev["text"]
 
     async def transcribe(self, pcm: bytes) -> str:
-        """Speech-to-text with one retry, holding the NPU. We have seen rare NPU errors
+        """Speech-to-text with one retry, holding the NPU when Whisper runs there. We have seen rare NPU errors
         ("qds_device::wait() unexpected command state") that a retry, or reloading Whisper, clears."""
         wav = pcm_to_wav(pcm)
-        async with self._npu:
+        async with self._npu if on_npu(self.names["stt"]) else contextlib.nullcontext():
             for attempt in (1, 2):
                 try:
                     return await self.lm.transcribe(wav, self.names["stt"], self.cfg.voice.language)
@@ -190,7 +215,7 @@ class ModelManager:
         try:
             self._set("stt", "loading")
             await self.lm.unload(self.names["stt"])
-            await self.lm.load(self.names["stt"])
+            await self.lm.load(self.names["stt"], **self._options("stt"))
             self.state["stt"] = "ready"
             self._notify()
         except (LemonadeError, httpx.HTTPError) as e:

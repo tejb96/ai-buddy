@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from ai_buddy.config import load_config
-from ai_buddy.prompts import chat_system_prompt
+from ai_buddy.prompts import Persona, chat_system_prompt
 from ai_buddy.skills import BUILTIN_DIR, MAX_PROMPT_CHARS, SkillError, SkillSet, discover, load_skill, parse_skill_md, \
     validate
 
@@ -137,7 +137,7 @@ def test_instructions_only_skill_goes_into_the_chat_prompt(tmp_path):
     assert extra[1] == "- Pirate: Say arr. Often."
     assert len(extra[0]) <= MAX_PROMPT_CHARS + len("- Essay: ")
     cfg = load_config()
-    prompt = chat_system_prompt(cfg.persona, "UTC", skills.chat_instructions(), extra=extra)
+    prompt = chat_system_prompt(Persona.of(cfg), "UTC", skills.chat_instructions(), extra=extra)
     assert "Skills the user switched on:\n- Essay:" in prompt and "- Pirate: Say arr. Often." in prompt
 
 
@@ -161,6 +161,6 @@ def test_prompt_is_stable_and_lists_enabled_tools_only():
     cfg = load_config()
     a = SkillSet(discover(), ["clock", "web-search"])
     b = SkillSet(discover(), ["web-search", "clock"])
-    pa = chat_system_prompt(cfg.persona, "UTC", a.chat_instructions(), "audio")
-    assert pa == chat_system_prompt(cfg.persona, "UTC", b.chat_instructions(), "audio")
+    pa = chat_system_prompt(Persona.of(cfg), "UTC", a.chat_instructions())
+    assert pa == chat_system_prompt(Persona.of(cfg), "UTC", b.chat_instructions())
     assert "get_datetime" in pa and "web_search" in pa and "search_notes" not in pa and "calculate" not in pa

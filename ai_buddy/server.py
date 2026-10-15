@@ -9,6 +9,7 @@ import os
 import shutil
 import subprocess
 import wave
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -23,7 +24,7 @@ from .knowledge import KnowledgeBase
 from .lemonade import TTS_SAMPLE_RATE, Lemonade, LemonadeError
 from .models import ModelManager
 from .session import Services, Session
-from .settings import VOICES, Settings
+from .settings import VOICES, Settings, voice_name
 from .skills import SkillSet
 from .skills.mcp import McpManager
 from .storage import Store
@@ -55,15 +56,16 @@ def pcm_to_wav24(pcm: bytes) -> bytes:
     return buf.getvalue()
 
 
-def create_app(cfg: Config) -> FastAPI:
+def create_app(cfg: Config, shutdown: Callable[[], None] | None = None) -> FastAPI:
+    """The app. `shutdown` stops the server (the Exit button); without it, Exit only unloads the models."""
     settings = Settings(cfg)
     lm = Lemonade(cfg.lemonade.base_url, cfg.lemonade.load_timeout_s)
-    models = ModelManager(lm, cfg, llm=settings.llm, voice=settings.voice)
+    models = ModelManager(lm, cfg, llm=settings.llm, voice=settings.voice, stt=settings.stt)
     skills = SkillSet.from_config(cfg, settings.skills)
     mcp = McpManager(cfg, skills)
     coach = skills.skills.get("speaking-coach")
     scenarios = coach.modules["modes"].SCENARIOS if coach and "modes" in coach.modules else {}
-    store = Store(cfg.app.data_path, cfg.persona.name, scenarios)
+    store = Store(cfg.app.data_path, voice_name(models.voice), scenarios)
     web = httpx.AsyncClient(timeout=httpx.Timeout(10.0), follow_redirects=True)
     folder = settings.knowledge_folder
     if folder and str(folder) == os.path.expanduser(cfg.rag.folder) and not folder.exists():
@@ -75,6 +77,9 @@ def create_app(cfg: Config) -> FastAPI:
     svc = Services(cfg, lm, models, store, skills, ToolContext(cfg, web, knowledge, local_timezone()), knowledge)
     allowed_origins = {f"http://{h}:{cfg.app.port}" for h in ("127.0.0.1", "localhost", cfg.app.host)}
     notes_running = False
+    sessions: set[Session] = set()      # one per open window
+    background: list[asyncio.Task] = []
+    exiting = False
 
     async def sync_notes() -> None:
         """Index the knowledge folder (and watch it) only while the notes skill is on."""
@@ -96,8 +101,11 @@ def create_app(cfg: Config) -> FastAPI:
     def on_setting(key: str, value: str) -> None:
         if key == "voice":
             models.voice = value
+            store.assistant_name = voice_name(value)     # the assistant is named after its voice
         elif key == "llm":
             models.switch_llm(value)
+        elif key == "stt":
+            models.switch_stt(value)
         elif key == "knowledge_folder" and notes_running:
             asyncio.get_running_loop().create_task(knowledge.set_folder(settings.knowledge_folder))
         elif key == "knowledge_folder":
@@ -125,9 +133,10 @@ def create_app(cfg: Config) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        tasks = [asyncio.create_task(warm_start()), asyncio.create_task(sync_notes()), asyncio.create_task(mcp.sync())]
+        background[:] = [asyncio.create_task(warm_start()), asyncio.create_task(sync_notes()),
+                         asyncio.create_task(mcp.sync())]
         yield
-        for t in tasks:
+        for t in background:
             t.cancel()
         await mcp.close()
         await knowledge.close()
@@ -150,7 +159,7 @@ def create_app(cfg: Config) -> FastAPI:
 
     def config_view() -> dict:
         return {
-            "persona": cfg.persona.name,
+            "persona": svc.persona.name,
             "models": models.names,
             "voice": models.voice,
             "practice": vars(cfg.practice),
@@ -182,6 +191,28 @@ def create_app(cfg: Config) -> FastAPI:
         await asyncio.sleep(0)      # let an MCP server start connecting before answering
         return config_view()
 
+    @app.post("/api/exit", dependencies=[Depends(same_origin)])
+    async def exit_app():
+        """The Exit button: stop every session (feedback still being written too), unload all models from
+        Lemonade, then stop the server. The window closes itself, and __main__ closes the app window it opened."""
+        nonlocal exiting
+        exiting = True
+        warm = background[0] if background else None
+        if warm and not warm.done():
+            warm.cancel()           # still loading models at startup: stop before unloading
+        for session in list(sessions):
+            await session.stop()
+        unloaded = True
+        try:
+            await models.unload_all()
+        except (LemonadeError, httpx.HTTPError) as e:
+            log.warning("unloading the models failed: %s", e)
+            unloaded = False
+        if shutdown:
+            asyncio.get_running_loop().call_later(0.3, shutdown)     # after this response has gone out
+        log.info("Exit: models unloaded=%s, stopping=%s", unloaded, shutdown is not None)
+        return {"unloaded": unloaded, "stopping": shutdown is not None}
+
     @app.get("/api/status")
     async def get_status():
         try:
@@ -194,9 +225,13 @@ def create_app(cfg: Config) -> FastAPI:
 
     def settings_view() -> dict:
         llms = list(dict.fromkeys(cfg.models.llm_choices + [models.names["llm"]]))
-        return {"voice": models.voice, "voices": VOICES, "llm": models.names["llm"], "llms": llms,
-                "stt": models.names["stt"], "tts": models.names["tts"], "embed": models.names.get("embed"),
-                "hears_audio": models.hears_audio(), "knowledge": knowledge.status(), "skills": skills.view(),
+        stts = list(dict.fromkeys(cfg.models.stt_choices + [models.names["stt"]]))
+        return {"voice": models.voice, "voices": VOICES, "default_voice": cfg.voice.tts_voice,
+                "persona": svc.persona.name, "llm": models.names["llm"], "llms": llms,
+                "default_llm": cfg.models.llm, "stt": models.names["stt"], "stts": stts,
+                "default_stt": cfg.models.stt, "stt_device": models.device("stt"), "tts": models.names["tts"],
+                "embed": models.names.get("embed"),
+                "knowledge": knowledge.status(), "skills": skills.view(),
                 "can_pick_folder": bool(shutil.which("zenity"))}
 
     @app.get("/api/settings")
@@ -214,6 +249,10 @@ def create_app(cfg: Config) -> FastAPI:
             if llm not in cfg.models.llm_choices and llm != models.names["llm"]:
                 raise HTTPException(400, f"{llm!r} is not in models.llm_choices")
             changes["llm"] = llm
+        if (stt := body.get("stt")) is not None:
+            if stt not in cfg.models.stt_choices and stt != models.names["stt"]:
+                raise HTTPException(400, f"{stt!r} is not in models.stt_choices")
+            changes["stt"] = stt
         if (folder := body.get("knowledge_folder")) is not None:
             path = Path(os.path.expanduser(str(folder).strip())) if str(folder).strip() else None
             if path and not path.is_dir():
@@ -227,7 +266,7 @@ def create_app(cfg: Config) -> FastAPI:
         if voice not in VOICES:
             raise HTTPException(400, "Unknown voice")
         try:
-            pcm = b"".join([c async for c in lm.tts_stream(PREVIEW_LINE.format(name=cfg.persona.name),
+            pcm = b"".join([c async for c in lm.tts_stream(PREVIEW_LINE.format(name=voice_name(voice)),
                                                             models.names["tts"], voice, cfg.voice.tts_speed)])
         except LemonadeError as e:
             raise HTTPException(503, str(e)) from e
@@ -252,7 +291,7 @@ def create_app(cfg: Config) -> FastAPI:
             raise HTTPException(501, "zenity is not installed; type the folder path instead")
         start = str(settings.knowledge_folder or Path.home()) + "/"
         proc = await asyncio.create_subprocess_exec(
-            "zenity", "--file-selection", "--directory", f"--title=Choose {cfg.persona.name}'s knowledge folder",
+            "zenity", "--file-selection", "--directory", "--title=Choose the knowledge folder",
             f"--filename={start}", stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         out, _ = await proc.communicate()
         path = out.decode().strip()
@@ -292,7 +331,15 @@ def create_app(cfg: Config) -> FastAPI:
         if ws.headers.get("origin") not in allowed_origins:
             await ws.close(code=4403)
             return
+        if exiting:
+            await ws.close(code=4410)       # the app is shutting down
+            return
         await ws.accept()
-        await Session(ws, svc).run()
+        session = Session(ws, svc)
+        sessions.add(session)
+        try:
+            await session.run()
+        finally:
+            sessions.discard(session)
 
     return app

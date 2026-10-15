@@ -390,3 +390,17 @@ dialog.settings { width: min(640px, calc(100vw - 32px)); }
 .confirm.allowed { border-color: var(--good); background: transparent; }
 .confirm.declined { border-color: var(--hairline); background: transparent; }
 .confirm-result { font-size: 13px; color: var(--ink-2); }
+
+/* ---------- following the conversation, exiting ---------- */
+.jump-latest {
+  position: fixed; left: 50%; bottom: 196px; transform: translateX(-50%); z-index: 5;
+  border: 1px solid var(--border); background: var(--surface); color: var(--ink-2); box-shadow: var(--shadow);
+  padding: 5px 12px; border-radius: 999px; font-size: 13px; font-weight: 600; cursor: pointer;
+}
+.jump-latest:hover { color: var(--ink); background: var(--surface-2); }
+.jump-latest[hidden] { display: none; }
+.icon-btn.exit:hover { color: var(--critical); }
+.stopped { position: fixed; inset: 0; z-index: 10; display: grid; place-items: center; padding: 16px;
+  background: color-mix(in srgb, var(--page) 92%, transparent); backdrop-filter: blur(4px); }
+.stopped[hidden] { display: none; }
+.stopped .card { max-width: 440px; text-align: center; }
