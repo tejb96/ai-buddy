@@ -21,6 +21,8 @@ class FakeLemonade:
 
     async def load(self, model, ctx_size=None, **options):
         self.loaded[model] = options
+        self.ctx = getattr(self, "ctx", {})
+        self.ctx[model] = ctx_size
 
     async def transcribe(self, wav, model, language="en"):
         await asyncio.sleep(0.01)
@@ -60,3 +62,14 @@ async def test_exit_unloads_everything_and_loads_nothing_more():
     assert lm.unloaded_all and not lm.loaded and set(models.state.values()) == {"standby"}
     with pytest.raises(LemonadeError, match="shutting down"):
         await models.ensure("llm")
+
+
+async def test_the_embedding_model_loads_on_the_cpu_with_a_small_context():
+    cfg = Config()
+    cfg.models.embed = "Qwen3-Embedding-0.6B-GGUF"
+    lm = FakeLemonade()
+    models = ModelManager(lm, cfg)
+    await models.ensure("llm", "embed")
+    assert lm.loaded["Qwen3-Embedding-0.6B-GGUF"] == {"llamacpp_backend": "cpu", "llamacpp_args": "--threads 4"}
+    assert lm.ctx == {cfg.models.llm: 32768, "Qwen3-Embedding-0.6B-GGUF": 8192}
+    assert models.device("embed") == "CPU"

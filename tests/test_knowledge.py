@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 from ai_buddy.knowledge import (KnowledgeBase, chunk_document, embed_format, extract, fts_query, is_indexable, keywords,
-                                pack, rrf, sections)
+                                min_similarity, pack, rrf, sections)
 
 HENDERSON = """# Henderson project: talking points
 - Open with the Henderson ops team story: they saved ten hours a week after switching to automated reports.
@@ -178,6 +178,39 @@ async def test_without_the_embedding_model_search_falls_back_to_keywords(tmp_pat
     emb.fail = False
     await kb.reindex()                                   # tried again on the next scan
     assert kb.status()["embeddings"] == "ready"
+    await kb.close()
+
+
+async def test_strict_search_needs_meaning_not_a_shared_word(tmp_path):
+    """Practice talking points: a resume that merely shares "learning" with a talk about sleep isn't one of them."""
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    (notes / "resume.md").write_text("# Resume\nMachine learning engineer: Python, model training, deployment.")
+    (notes / "sleep-talk.md").write_text("# Sleep talk: talking points\nDeep sleep keeps facts; REM links ideas.")
+
+    async def embed(texts):           # "meaning": resume-like texts point one way, sleep-like texts the other
+        return [[1.0, 0.05] if ("resume" in t.lower() or "python" in t.lower()) else [0.05, 1.0] for t in texts]
+    kb = KnowledgeBase(tmp_path / "kb.db", notes, watch=False, embed=embed, embed_model="Qwen3-Embedding-0.6B-GGUF")
+    await kb.reindex()
+    query = "why sleep matters for learning talking points"
+    assert {h.file for h in await kb.search(query, 4)} == {"resume.md", "sleep-talk.md"}     # "learning" matches
+    assert [h.file for h in await kb.search(query, 4, strict=True)] == ["sleep-talk.md"]
+    assert await kb.search("python resume", 4, strict=True) != []
+    await kb.close()
+
+
+async def test_passages_found_only_by_meaning_must_be_close_enough(tmp_path):
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    (notes / "resume.md").write_text("# Resume\nData analyst at Prairie Health.")
+
+    async def embed(texts):           # everything is only weakly related (cosine 0.3)
+        return [[1.0, 0.0] if t.startswith("Instruct") else [0.3, 0.954] for t in texts]
+    kb = KnowledgeBase(tmp_path / "kb.db", notes, watch=False, embed=embed, embed_model="Qwen3-Embedding-0.6B-GGUF")
+    await kb.reindex()
+    assert kb.min_sim == min_similarity("Qwen3-Embedding-0.6B-GGUF") == 0.38
+    assert await kb.search("what's in my notes about the budget?", 4) == []     # nothing in common, nothing found
+    assert [h.file for h in await kb.search("Prairie Health", 4)] == ["resume.md"]   # the words still find it
     await kb.close()
 
 

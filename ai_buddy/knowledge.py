@@ -225,11 +225,20 @@ EMBED_FORMATS = {
     # nomic-embed-text v1/v1.5: a task prefix on both sides.
     "nomic-embed-text": ("search_query: {query}", "search_document: {title}\n{text}"),
 }
+# Below this cosine similarity a passage found only by meaning doesn't count as a match: the nearest passage
+# always comes back, related or not. Qwen3-Embedding-0.6B on real notes (a resume): questions about it scored
+# 0.39-0.53, unrelated questions at most 0.35. The nomic value is a guess (not measured).
+MIN_SIMILARITY = {"qwen3-embedding": 0.38, "nomic-embed-text": 0.5}
 
 
 def embed_format(model: str) -> tuple[str, str]:
     key = model.lower()
     return next((fmt for family, fmt in EMBED_FORMATS.items() if family in key), ("{query}", "{title}\n{text}"))
+
+
+def min_similarity(model: str) -> float:
+    key = model.lower()
+    return next((v for family, v in MIN_SIMILARITY.items() if family in key), 0.4)
 
 
 class KnowledgeBase:
@@ -242,6 +251,7 @@ class KnowledgeBase:
         self.embed = embed
         self.embed_model = embed_model
         self.query_fmt, self.doc_fmt = embed_format(embed_model)
+        self.min_sim = min_similarity(embed_model)
         self.embed_state = "off" if embed is None else "pending"
         self._matrix: tuple[int, np.ndarray, np.ndarray] | None = None   # (version, chunk ids, vectors)
         self._version = 0
@@ -454,12 +464,20 @@ class KnowledgeBase:
                 "errors": errors, "embeddings": self.embed_state, "embed_model": self.embed_model or None,
                 "embedded_chunks": embedded}
 
-    async def search(self, query: str, k: int = 4) -> list[Hit]:
+    async def search(self, query: str, k: int = 4, strict: bool = False) -> list[Hit]:
+        """Passages for `query`: keywords (BM25) and meaning (embeddings), fused by rank. Passages found only by
+        meaning must be similar enough (min_similarity). `strict` (practice background and talking points, where
+        nobody judges the passages before they're used): with embeddings, every passage must be similar enough in
+        meaning; a shared word ("learning", "points") isn't enough."""
         ranked = await asyncio.to_thread(self._bm25, query, max(k * 4, 20))
         if self.embed is not None and self.embed_state in ("ready", "indexing"):
             try:
                 qv = np.asarray((await self.embed([self.query_fmt.format(query=query)]))[0], dtype=np.float32)
-                dense = await asyncio.to_thread(self._dense, qv, max(k * 4, 20))
+                scored = await asyncio.to_thread(self._dense, qv, None)
+                dense = [(cid, sim) for cid, sim in scored if sim >= self.min_sim][:max(k * 4, 20)]
+                if strict:
+                    near = {cid for cid, _ in dense}
+                    ranked = [(cid, score) for cid, score in ranked if cid in near]
                 ranked = rrf([ranked, dense]) if ranked else dense
             except Exception as e:
                 log.warning("embedding search failed, using keywords only: %s", e)
@@ -473,7 +491,7 @@ class KnowledgeBase:
                            "ORDER BY 2 LIMIT ?", (q, limit))
         return [(cid, -score) for cid, score in rows]
 
-    def _dense(self, qv: np.ndarray, limit: int) -> list[tuple[int, float]]:
+    def _dense(self, qv: np.ndarray, limit: int | None) -> list[tuple[int, float]]:
         if self._matrix is None or self._matrix[0] != self._version:
             rows = self._query("SELECT id, vec FROM chunks WHERE vec IS NOT NULL")
             ids = np.array([r[0] for r in rows], dtype=np.int64)

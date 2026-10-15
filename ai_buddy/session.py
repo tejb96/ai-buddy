@@ -428,11 +428,12 @@ class Session:
     # ---------- notes ----------
 
     async def _notes(self, query: str, k: int, max_chars: int) -> str:
+        """Background or talking points for practice, from the notes: only passages that really match."""
         kb = self.svc.knowledge
         if not (kb and kb.folder and query.strip() and self.svc.skills.is_enabled("notes")):
             return ""
         try:
-            return notes_block(await kb.search(query, k), max_chars)
+            return notes_block(await kb.search(query, k, strict=True), max_chars)
         except Exception as e:
             log.warning("note search failed: %s", e)
             return ""
